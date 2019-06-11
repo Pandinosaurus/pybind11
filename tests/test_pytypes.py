@@ -251,3 +251,8 @@ def test_number_protocol():
 def test_list_slicing():
     li = list(range(100))
     assert li[::2] == m.test_list_slicing(li)
+
+
+def test_str_isinstance():
+    assert m.is_str_instance(u"abc")
+    assert not m.is_str_instance(b"abc")

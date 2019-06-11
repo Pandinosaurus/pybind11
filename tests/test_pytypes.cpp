@@ -290,6 +290,9 @@ TEST_SUBMODULE(pytypes, m) {
         return l;
     });
 
+    // test_str_isinstance
+    m.def("is_str_instance", [](py::object o) { return py::isinstance<py::str>(o); });
+
     m.def("test_list_slicing", [](py::list a) {
         return a[py::slice(0, -1, 2)];
     });
