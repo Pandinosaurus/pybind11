@@ -73,15 +73,26 @@ v2.3.0 (June 11, 2019)
 * Support for ``std::unique_ptr`` holders, whose deleters differ between a base and derived
   class. `#1353 <https://github.com/pybind/pybind11/pull/1353>`_.
 
+* Construction of STL array/vector-like data structures from
+  iterators. Added an ``extend()`` operation.
+  `#1709 <https://github.com/pybind/pybind11/pull/1709>`_,
+
+* CMake build system improvements for projects that include non-C++
+  files (e.g. plain C, CUDA) in ``pybind11_add_module`` et al.
+  `#1678 <https://github.com/pybind/pybind11/pull/1678>`_.
+
+* Fixed asynchronous invocation and deallocation of Python functions
+  wrapped in ``std::function``.
+  `#1595 <https://github.com/pybind/pybind11/pull/1595>`_.
+
 * Fixes regarding return value policy propagation in STL type casters.
   `#1603 <https://github.com/pybind/pybind11/pull/1603>`_.
 
 * Fixed scoped enum comparisons.
   `#1571 <https://github.com/pybind/pybind11/pull/1571>`_.
 
-* CMake build system improvements for projects that include non-C++
-  files (e.g. plain C, CUDA) in ``pybind11_add_module`` et al.
-  `#1678 <https://github.com/pybind/pybind11/pull/1678>`_.
+* Fixed iostream redirection for code that releases the GIL.
+  `#1368 <https://github.com/pybind/pybind11/pull/1368>`_,
 
 * A number of CI-related fixes.
   `#1757 <https://github.com/pybind/pybind11/pull/1757>`_,
