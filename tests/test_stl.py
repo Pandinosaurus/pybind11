@@ -1,6 +1,15 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import textwrap
+import weakref
+
 import pytest
 
+import env
+import pybind11_tests
 from pybind11_tests import ConstructorStats, UserType
 from pybind11_tests import stl as m
 
@@ -15,15 +24,145 @@ def test_vector(doc):
 
     assert m.cast_bool_vector() == [True, False]
     assert m.load_bool_vector([True, False])
+    assert m.load_bool_vector((True, False))
 
-    assert doc(m.cast_vector) == "cast_vector() -> List[int]"
-    assert doc(m.load_vector) == "load_vector(arg0: List[int]) -> bool"
+    assert doc(m.cast_vector) == "cast_vector() -> list[int]"
+    assert (
+        doc(m.load_vector)
+        == "load_vector(arg0: collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex]) -> bool"
+    )
 
     # Test regression caused by 936: pointers to stl containers weren't castable
     assert m.cast_ptr_vector() == ["lvalue", "lvalue"]
 
+    if hasattr(m, "func_with_string_views"):
 
-def test_deque(doc):
+        def gen():
+            return ("a" + str(x) for x in range(10000, 10010))
+
+        expected = list(gen())
+        assert m.func_with_string_views(gen()) == expected
+        assert m.func_with_string_views(x.encode() for x in gen()) == expected
+        assert (
+            m.func_with_string_views(bytearray(x.encode()) for x in gen()) == expected
+        )
+
+
+@pytest.mark.skipif(
+    not hasattr(m, "string_view_life_support_check"), reason="no <string_view>"
+)
+@pytest.mark.skipif("env.GRAALPY", reason="Cannot reliably trigger GC")
+def test_string_view_life_support_during_argument_conversion():
+    # Design background: PR #6096, "Why these lifetime tests are deliberately
+    # implementation-aware".
+    # This test uses conversion of a later argument as a checkpoint between
+    # loading the string views and entering the C++ function. Argument casters
+    # run left-to-right: after the first argument creates the views, the second
+    # argument's __index__ clears the list that owned their Python strings and
+    # forces GC. The C++ probe checks only whether those strings were destroyed,
+    # never the potentially dangling views. Zero during the call proves that
+    # loader life support worked; dead weakrefs afterward prove that it did not
+    # keep the strings alive too long.
+    destroyed = []
+
+    class TrackedString(str):
+        pass
+
+    source = [TrackedString("first"), TrackedString("second")]
+    weakrefs = [weakref.ref(item, lambda _: destroyed.append(None)) for item in source]
+
+    # Clear the only Python owners after the views have loaded, but before the
+    # bound function is called.
+    class ClearSourceOnIndex:
+        def __index__(self):
+            source.clear()
+            pytest.gc_collect()
+            return 0
+
+    assert (
+        m.string_view_life_support_check(source, ClearSourceOnIndex(), destroyed) == 0
+    )
+    assert source == []
+    pytest.gc_collect()
+    assert len(destroyed) == 2
+    assert all(ref() is None for ref in weakrefs)
+
+
+@pytest.mark.skipif(
+    not hasattr(m, "string_view_life_support_check"), reason="no <string_view>"
+)
+@pytest.mark.skipif("env.GRAALPY", reason="Cannot reliably trigger GC")
+@pytest.mark.parametrize(
+    ("element_type", "values"),
+    [
+        pytest.param(str, ("first", "second"), id="str"),
+        pytest.param(bytes, (b"first", b"second"), id="bytes"),
+        pytest.param(bytearray, (b"first", b"second"), id="bytearray"),
+    ],
+)
+def test_string_view_life_support_for_generator(element_type, values):
+    destroyed = []
+
+    class Tracked(element_type):
+        def __del__(self):
+            destroyed.append(None)
+
+    def source():
+        for value in values:
+            yield Tracked(value)
+
+    class CollectGarbageOnIndex:
+        def __index__(self):
+            pytest.gc_collect()
+            return 0
+
+    assert (
+        m.string_view_life_support_check(source(), CollectGarbageOnIndex(), destroyed)
+        == 0
+    )
+    pytest.gc_collect()
+    assert len(destroyed) == len(values)
+
+
+@pytest.mark.skipif(
+    not hasattr(m, "nested_string_view_life_support_check"),
+    reason="no <string_view>",
+)
+@pytest.mark.skipif("env.GRAALPY", reason="Cannot reliably trigger GC")
+def test_string_view_life_support_for_nested_containers():
+    # Design background: PR #6096, "Why these lifetime tests are deliberately
+    # implementation-aware". This uses the later-argument checkpoint described
+    # in test_string_view_life_support_during_argument_conversion. Here,
+    # clearing the outer list also releases the inner lists, verifying that life
+    # support reaches every Python string backing a view in the recursively
+    # converted std::vector<std::vector<std::string_view>>.
+    destroyed = []
+
+    class TrackedString(str):
+        def __del__(self):
+            destroyed.append(None)
+
+    source = [
+        [TrackedString("first"), TrackedString("second")],
+        [TrackedString("third"), TrackedString("fourth")],
+    ]
+
+    class ClearSourceOnIndex:
+        def __index__(self):
+            source.clear()
+            pytest.gc_collect()
+            return 0
+
+    assert (
+        m.nested_string_view_life_support_check(source, ClearSourceOnIndex(), destroyed)
+        == 0
+    )
+    assert source == []
+    pytest.gc_collect()
+    assert len(destroyed) == 4
+
+
+def test_deque():
     """std::deque <-> list"""
     lst = m.cast_deque()
     assert lst == [1]
@@ -37,9 +176,23 @@ def test_array(doc):
     lst = m.cast_array()
     assert lst == [1, 2]
     assert m.load_array(lst)
+    assert m.load_array(tuple(lst))
 
-    assert doc(m.cast_array) == "cast_array() -> List[int[2]]"
-    assert doc(m.load_array) == "load_array(arg0: List[int[2]]) -> bool"
+    assert (
+        doc(m.cast_array)
+        == 'cast_array() -> typing.Annotated[list[int], "FixedSize(2)"]'
+    )
+    assert (
+        doc(m.load_array)
+        == 'load_array(arg0: typing.Annotated[collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex], "FixedSize(2)"]) -> bool'
+    )
+
+
+def test_array_no_default_ctor():
+    lst = m.NoDefaultCtorArray(3)
+    assert [e.val for e in lst.arr] == [13, 23]
+    lst.arr = m.NoDefaultCtorArray(4).arr
+    assert [e.val for e in lst.arr] == [14, 24]
 
 
 def test_valarray(doc):
@@ -47,9 +200,13 @@ def test_valarray(doc):
     lst = m.cast_valarray()
     assert lst == [1, 4, 9]
     assert m.load_valarray(lst)
+    assert m.load_valarray(tuple(lst))
 
-    assert doc(m.cast_valarray) == "cast_valarray() -> List[int]"
-    assert doc(m.load_valarray) == "load_valarray(arg0: List[int]) -> bool"
+    assert doc(m.cast_valarray) == "cast_valarray() -> list[int]"
+    assert (
+        doc(m.load_valarray)
+        == "load_valarray(arg0: collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex]) -> bool"
+    )
 
 
 def test_map(doc):
@@ -61,8 +218,10 @@ def test_map(doc):
     assert "key2" in d
     assert m.load_map(d)
 
-    assert doc(m.cast_map) == "cast_map() -> Dict[str, str]"
-    assert doc(m.load_map) == "load_map(arg0: Dict[str, str]) -> bool"
+    assert doc(m.cast_map) == "cast_map() -> dict[str, str]"
+    assert (
+        doc(m.load_map) == "load_map(arg0: collections.abc.Mapping[str, str]) -> bool"
+    )
 
 
 def test_set(doc):
@@ -71,9 +230,10 @@ def test_set(doc):
     assert s == {"key1", "key2"}
     s.add("key3")
     assert m.load_set(s)
+    assert m.load_set(frozenset(s))
 
-    assert doc(m.cast_set) == "cast_set() -> Set[str]"
-    assert doc(m.load_set) == "load_set(arg0: Set[str]) -> bool"
+    assert doc(m.cast_set) == "cast_set() -> set[str]"
+    assert doc(m.load_set) == "load_set(arg0: collections.abc.Set[str]) -> bool"
 
 
 def test_recursive_casting():
@@ -92,7 +252,8 @@ def test_recursive_casting():
 
     # Issue #853 test case:
     z = m.cast_unique_ptr_vector()
-    assert z[0].value == 7 and z[1].value == 42
+    assert z[0].value == 7
+    assert z[1].value == 42
 
 
 def test_move_out_container():
@@ -199,10 +360,15 @@ def test_boost_optional():
     assert int(props.access_by_copy) == 42
 
 
-def test_reference_sensitive_optional():
+def test_reference_sensitive_optional(doc):
     assert m.double_or_zero_refsensitive(None) == 0
     assert m.double_or_zero_refsensitive(42) == 84
     pytest.raises(TypeError, m.double_or_zero_refsensitive, "foo")
+
+    assert (
+        doc(m.double_or_zero_refsensitive)
+        == "double_or_zero_refsensitive(arg0: typing.SupportsInt | typing.SupportsIndex | None) -> int"
+    )
 
     assert m.half_or_none_refsensitive(0) is None
     assert m.half_or_none_refsensitive(42) == 21
@@ -240,11 +406,69 @@ def test_fs_path():
         def __fspath__(self):
             return b"foo/bar"
 
+    # Single argument
     assert m.parent_path(Path("foo/bar")) == Path("foo")
     assert m.parent_path("foo/bar") == Path("foo")
     assert m.parent_path(b"foo/bar") == Path("foo")
     assert m.parent_path(PseudoStrPath()) == Path("foo")
     assert m.parent_path(PseudoBytesPath()) == Path("foo")
+    # std::vector
+    assert m.parent_paths(["foo/bar", "foo/baz"]) == [Path("foo"), Path("foo")]
+    # py::typing::List
+    assert m.parent_paths_list(["foo/bar", "foo/baz"]) == [Path("foo"), Path("foo")]
+    # Nested py::typing::List
+    assert m.parent_paths_nested_list([["foo/bar"], ["foo/baz", "foo/buzz"]]) == [
+        [Path("foo")],
+        [Path("foo"), Path("foo")],
+    ]
+    # py::typing::Tuple
+    assert m.parent_paths_tuple(("foo/bar", "foo/baz")) == (Path("foo"), Path("foo"))
+    # py::typing::Dict
+    assert m.parent_paths_dict(
+        {
+            "key1": Path("foo/bar"),
+            "key2": "foo/baz",
+            "key3": b"foo/buzz",
+        }
+    ) == {
+        "key1": Path("foo"),
+        "key2": Path("foo"),
+        "key3": Path("foo"),
+    }
+
+
+@pytest.mark.skipif(not hasattr(m, "has_filesystem"), reason="no <filesystem>")
+def test_path_typing(doc):
+    # Single argument
+    assert (
+        doc(m.parent_path)
+        == "parent_path(arg0: os.PathLike | str | bytes) -> pathlib.Path"
+    )
+    # std::vector
+    assert (
+        doc(m.parent_paths)
+        == "parent_paths(arg0: collections.abc.Sequence[os.PathLike | str | bytes]) -> list[pathlib.Path]"
+    )
+    # py::typing::List
+    assert (
+        doc(m.parent_paths_list)
+        == "parent_paths_list(arg0: list[os.PathLike | str | bytes]) -> list[pathlib.Path]"
+    )
+    # Nested py::typing::List
+    assert (
+        doc(m.parent_paths_nested_list)
+        == "parent_paths_nested_list(arg0: list[list[os.PathLike | str | bytes]]) -> list[list[pathlib.Path]]"
+    )
+    # py::typing::Tuple
+    assert (
+        doc(m.parent_paths_tuple)
+        == "parent_paths_tuple(arg0: tuple[os.PathLike | str | bytes, os.PathLike | str | bytes]) -> tuple[pathlib.Path, pathlib.Path]"
+    )
+    # py::typing::Dict
+    assert (
+        doc(m.parent_paths_dict)
+        == "parent_paths_dict(arg0: dict[str, os.PathLike | str | bytes]) -> dict[str, pathlib.Path]"
+    )
 
 
 @pytest.mark.skipif(not hasattr(m, "load_variant"), reason="no <variant>")
@@ -260,7 +484,24 @@ def test_variant(doc):
     assert m.cast_variant() == (5, "Hello")
 
     assert (
-        doc(m.load_variant) == "load_variant(arg0: Union[int, str, float, None]) -> str"
+        doc(m.load_variant)
+        == "load_variant(arg0: typing.SupportsInt | typing.SupportsIndex | str | typing.SupportsFloat | typing.SupportsIndex | None) -> str"
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(m, "load_monostate_variant"), reason="no std::monostate"
+)
+def test_variant_monostate(doc):
+    assert m.load_monostate_variant(None) == "std::monostate"
+    assert m.load_monostate_variant(1) == "int"
+    assert m.load_monostate_variant("1") == "std::string"
+
+    assert m.cast_monostate_variant() == (None, 5, "Hello")
+
+    assert (
+        doc(m.load_monostate_variant)
+        == "load_monostate_variant(arg0: None | typing.SupportsInt | typing.SupportsIndex | str) -> str"
     )
 
 
@@ -280,10 +521,10 @@ def test_stl_pass_by_pointer(msg):
         msg(excinfo.value)
         == """
         stl_pass_by_pointer(): incompatible function arguments. The following argument types are supported:
-            1. (v: List[int] = None) -> List[int]
+            1. (v: collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex] = None) -> list[int]
 
         Invoked with:
-    """  # noqa: E501 line too long
+    """
     )
 
     with pytest.raises(TypeError) as excinfo:
@@ -292,10 +533,10 @@ def test_stl_pass_by_pointer(msg):
         msg(excinfo.value)
         == """
         stl_pass_by_pointer(): incompatible function arguments. The following argument types are supported:
-            1. (v: List[int] = None) -> List[int]
+            1. (v: collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex] = None) -> list[int]
 
         Invoked with: None
-    """  # noqa: E501 line too long
+    """
     )
 
     assert m.stl_pass_by_pointer([1, 2, 3]) == [1, 2, 3]
@@ -330,6 +571,7 @@ def test_function_with_string_and_vector_string_arg():
     assert m.func_with_string_or_vector_string_arg_overload("A") == 3
 
 
+@pytest.mark.skipif("env.GRAALPY", reason="Cannot reliably trigger GC")
 def test_stl_ownership():
     cstats = ConstructorStats.get(m.Placeholder)
     assert cstats.alive() == 0
@@ -347,7 +589,7 @@ def test_issue_1561():
     """check fix for issue #1561"""
     bar = m.Issue1561Outer()
     bar.list = [m.Issue1561Inner("bar")]
-    bar.list
+    assert bar.list
     assert bar.list[0].data == "bar"
 
 
@@ -356,3 +598,339 @@ def test_return_vector_bool_raw_ptr():
     v = m.return_vector_bool_raw_ptr()
     assert isinstance(v, list)
     assert len(v) == 4513
+
+
+@pytest.mark.parametrize(
+    ("fn", "offset"), [(m.pass_std_vector_int, 0), (m.pass_std_array_int_2, 1)]
+)
+def test_pass_std_vector_int(fn, offset):
+    assert fn([7, 13]) == 140 + offset
+    assert fn({6, 2}) == 116 + offset
+    assert fn({"x": 8, "y": 11}.values()) == 138 + offset
+    assert fn({3: None, 9: None}.keys()) == 124 + offset
+    assert fn(i for i in [4, 17]) == 142 + offset
+    assert fn(map(lambda i: i * 3, [8, 7])) == 190 + offset  # noqa: C417
+    with pytest.raises(TypeError):
+        fn({"x": 0, "y": 1})
+    with pytest.raises(TypeError):
+        fn({})
+
+
+def test_pass_std_vector_pair_int():
+    fn = m.pass_std_vector_pair_int
+    assert fn({1: 2, 3: 4}.items()) == 406
+    assert fn(zip([5, 17], [13, 9])) == 2222
+
+
+def test_list_caster_fully_consumes_generator_object():
+    def gen_invalid():
+        yield from [1, 2.0, 3]
+
+    gen_obj = gen_invalid()
+    with pytest.raises(TypeError):
+        m.pass_std_vector_int(gen_obj)
+    assert not tuple(gen_obj)
+
+
+def test_list_caster_rejects_class_named_generator():
+    class generator:
+        pass
+
+    with pytest.raises(TypeError, match="incompatible function arguments"):
+        m.pass_std_vector_int(generator())
+
+
+@pytest.mark.skipif(sys.platform.startswith("emscripten"), reason="Requires threads")
+@pytest.mark.skipif(env.ANDROID or env.IOS, reason="Requires subprocess support")
+def test_generator_check_does_not_deadlock():
+    """Two threads doing the first generator conversion at once must both finish.
+
+    The stable-ABI generator check imports `types` once. If the import releases the GIL
+    while another thread holds it and waits on the once-only guard, neither thread can
+    proceed. Runs in a subprocess so a regression shows up as a timeout, not a hang.
+    """
+    script = textwrap.dedent(
+        f"""
+        import sys
+        import threading
+
+        sys.path.insert(0, {os.path.dirname(env.__file__)!r})
+        sys.path.insert(0, {os.path.dirname(pybind11_tests.__file__)!r})
+
+        from pybind11_tests import stl as m
+
+        # A cold import runs importlib Python code, which can release the GIL.
+        del sys.modules["types"]
+        sys.setswitchinterval(1e-6)
+        start = threading.Barrier(2)
+
+        def convert():
+            start.wait()
+            for _ in range(100):
+                assert m.pass_std_vector_int(x for x in (1, 2, 3)) == 112
+
+        threads = [threading.Thread(target=convert) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        print("done")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "done"
+
+
+def test_pass_std_set_int():
+    fn = m.pass_std_set_int
+    assert fn({3, 15}) == 254
+    assert fn({5: None, 12: None}.keys()) == 251
+    with pytest.raises(TypeError):
+        fn([])
+    with pytest.raises(TypeError):
+        fn({})
+    with pytest.raises(TypeError):
+        fn({}.values())
+    with pytest.raises(TypeError):
+        fn(i for i in [])
+
+
+def test_set_caster_dict_keys_failure():
+    dict_keys = {1: None, 2.0: None, 3: None}.keys()
+    # The asserts does not really exercise anything in pybind11, but if one of
+    # them fails in some future version of Python, the set_caster load
+    # implementation may need to be revisited.
+    assert tuple(dict_keys) == (1, 2.0, 3)
+    assert tuple(dict_keys) == (1, 2.0, 3)
+    with pytest.raises(TypeError):
+        m.pass_std_set_int(dict_keys)
+    assert tuple(dict_keys) == (1, 2.0, 3)
+
+
+class FakePyMappingMissingItems:
+    def __getitem__(self, _):
+        raise RuntimeError("Not expected to be called.")
+
+
+class FakePyMappingWithItems(FakePyMappingMissingItems):
+    def items(self):
+        return ((1, 3), (2, 4))
+
+
+class FakePyMappingBadItems(FakePyMappingMissingItems):
+    def items(self):
+        return ((1, 2), (3, "x"))
+
+
+class FakePyMappingItemsNotCallable(FakePyMappingMissingItems):
+    @property
+    def items(self):
+        return ((1, 2), (3, 4))
+
+
+class FakePyMappingItemsWithArg(FakePyMappingMissingItems):
+    def items(self, _):
+        return ((1, 2), (3, 4))
+
+
+class FakePyMappingGenObj(FakePyMappingMissingItems):
+    def __init__(self, gen_obj):
+        super().__init__()
+        self.gen_obj = gen_obj
+
+    def items(self):
+        yield from self.gen_obj
+
+
+def test_pass_std_map_int():
+    fn = m.pass_std_map_int
+    assert fn({1: 2, 3: 4}) == 4506
+    with pytest.raises(TypeError):
+        fn([])
+    assert fn(FakePyMappingWithItems()) == 3507
+    with pytest.raises(TypeError):
+        fn(FakePyMappingMissingItems())
+    with pytest.raises(TypeError):
+        fn(FakePyMappingBadItems())
+    with pytest.raises(TypeError):
+        fn(FakePyMappingItemsNotCallable())
+    with pytest.raises(TypeError):
+        fn(FakePyMappingItemsWithArg())
+
+
+@pytest.mark.parametrize(
+    ("items", "expected_exception"),
+    [
+        (((1, 2), (3, "x"), (4, 5)), TypeError),
+        (((1, 2), (3, 4, 5), (6, 7)), ValueError),
+    ],
+)
+def test_map_caster_fully_consumes_generator_object(items, expected_exception):
+    def gen_invalid():
+        yield from items
+
+    gen_obj = gen_invalid()
+    with pytest.raises(expected_exception):
+        m.pass_std_map_int(FakePyMappingGenObj(gen_obj))
+    assert not tuple(gen_obj)
+
+
+def test_sequence_caster_protocol(doc):
+    from collections.abc import Sequence
+
+    # Implements the Sequence protocol without explicitly inheriting from collections.abc.Sequence.
+    class BareSequenceLike:
+        def __init__(self, *args):
+            self.data = tuple(args)
+
+        def __len__(self):
+            return len(self.data)
+
+        def __getitem__(self, index):
+            return self.data[index]
+
+    # Implements the Sequence protocol by reusing BareSequenceLike's implementation.
+    # Additionally, inherits from collections.abc.Sequence.
+    class FormalSequenceLike(BareSequenceLike, Sequence):
+        pass
+
+    # convert mode
+    assert (
+        doc(m.roundtrip_std_vector_int)
+        == "roundtrip_std_vector_int(arg0: collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex]) -> list[int]"
+    )
+    assert m.roundtrip_std_vector_int([1, 2, 3]) == [1, 2, 3]
+    assert m.roundtrip_std_vector_int((1, 2, 3)) == [1, 2, 3]
+    assert m.roundtrip_std_vector_int(FormalSequenceLike(1, 2, 3)) == [1, 2, 3]
+    assert m.roundtrip_std_vector_int(BareSequenceLike(1, 2, 3)) == [1, 2, 3]
+    assert m.roundtrip_std_vector_int([]) == []
+    assert m.roundtrip_std_vector_int(()) == []
+    assert m.roundtrip_std_vector_int(BareSequenceLike()) == []
+    # noconvert mode
+    assert (
+        doc(m.roundtrip_std_vector_int_noconvert)
+        == "roundtrip_std_vector_int_noconvert(v: list[int]) -> list[int]"
+    )
+    assert m.roundtrip_std_vector_int_noconvert([1, 2, 3]) == [1, 2, 3]
+    assert m.roundtrip_std_vector_int_noconvert((1, 2, 3)) == [1, 2, 3]
+    assert m.roundtrip_std_vector_int_noconvert(FormalSequenceLike(1, 2, 3)) == [
+        1,
+        2,
+        3,
+    ]
+    assert m.roundtrip_std_vector_int_noconvert(BareSequenceLike(1, 2, 3)) == [1, 2, 3]
+    assert m.roundtrip_std_vector_int_noconvert([]) == []
+    assert m.roundtrip_std_vector_int_noconvert(()) == []
+    assert m.roundtrip_std_vector_int_noconvert(BareSequenceLike()) == []
+
+
+def test_mapping_caster_protocol(doc):
+    from collections.abc import Mapping
+
+    # Implements the Mapping protocol without explicitly inheriting from collections.abc.Mapping.
+    class BareMappingLike:
+        def __init__(self, **kwargs):
+            self.data = dict(kwargs)
+
+        def __len__(self):
+            return len(self.data)
+
+        def __getitem__(self, key):
+            return self.data[key]
+
+        def __iter__(self):
+            yield from self.data
+
+    # Implements the Mapping protocol by reusing BareMappingLike's implementation.
+    # Additionally, inherits from collections.abc.Mapping.
+    class FormalMappingLike(BareMappingLike, Mapping):
+        pass
+
+    a1b2c3 = {"a": 1, "b": 2, "c": 3}
+    # convert mode
+    assert (
+        doc(m.roundtrip_std_map_str_int)
+        == "roundtrip_std_map_str_int(arg0: collections.abc.Mapping[str, typing.SupportsInt | typing.SupportsIndex]) -> dict[str, int]"
+    )
+    assert m.roundtrip_std_map_str_int(a1b2c3) == a1b2c3
+    assert m.roundtrip_std_map_str_int(FormalMappingLike(**a1b2c3)) == a1b2c3
+    assert m.roundtrip_std_map_str_int({}) == {}
+    assert m.roundtrip_std_map_str_int(FormalMappingLike()) == {}
+    with pytest.raises(TypeError):
+        m.roundtrip_std_map_str_int(BareMappingLike(**a1b2c3))
+    # noconvert mode
+    assert (
+        doc(m.roundtrip_std_map_str_int_noconvert)
+        == "roundtrip_std_map_str_int_noconvert(m: dict[str, int]) -> dict[str, int]"
+    )
+    assert m.roundtrip_std_map_str_int_noconvert(a1b2c3) == a1b2c3
+    assert m.roundtrip_std_map_str_int_noconvert({}) == {}
+    with pytest.raises(TypeError):
+        m.roundtrip_std_map_str_int_noconvert(FormalMappingLike(**a1b2c3))
+    with pytest.raises(TypeError):
+        m.roundtrip_std_map_str_int_noconvert(BareMappingLike(**a1b2c3))
+
+
+def test_set_caster_protocol(doc):
+    from collections.abc import Set as AbstractSet
+
+    # Implements the Set protocol without explicitly inheriting from collections.abc.Set.
+    class BareSetLike:
+        def __init__(self, *args):
+            self.data = set(args)
+
+        def __len__(self):
+            return len(self.data)
+
+        def __contains__(self, item):
+            return item in self.data
+
+        def __iter__(self):
+            yield from self.data
+
+    # Implements the Set protocol by reusing BareSetLike's implementation.
+    # Additionally, inherits from collections.abc.Set.
+    class FormalSetLike(BareSetLike, AbstractSet):
+        pass
+
+    # convert mode
+    assert (
+        doc(m.roundtrip_std_set_int)
+        == "roundtrip_std_set_int(arg0: collections.abc.Set[typing.SupportsInt | typing.SupportsIndex]) -> set[int]"
+    )
+    assert m.roundtrip_std_set_int({1, 2, 3}) == {1, 2, 3}
+    assert m.roundtrip_std_set_int(FormalSetLike(1, 2, 3)) == {1, 2, 3}
+    assert m.roundtrip_std_set_int(set()) == set()
+    assert m.roundtrip_std_set_int(FormalSetLike()) == set()
+    with pytest.raises(TypeError):
+        m.roundtrip_std_set_int(BareSetLike(1, 2, 3))
+    # noconvert mode
+    assert (
+        doc(m.roundtrip_std_set_int_noconvert)
+        == "roundtrip_std_set_int_noconvert(s: set[int]) -> set[int]"
+    )
+    assert m.roundtrip_std_set_int_noconvert({1, 2, 3}) == {1, 2, 3}
+    assert m.roundtrip_std_set_int_noconvert(set()) == set()
+    with pytest.raises(TypeError):
+        m.roundtrip_std_set_int_noconvert(FormalSetLike(1, 2, 3))
+    with pytest.raises(TypeError):
+        m.roundtrip_std_set_int_noconvert(BareSetLike(1, 2, 3))
+
+
+@pytest.mark.parametrize(
+    "name", ["map", "zip", "dict_keys", "dict_values", "dict_items"]
+)
+def test_non_iterable_user_class_named_like_builtin_iterable(name):
+    obj = type(name, (), {})()
+    with pytest.raises(TypeError, match="incompatible function arguments"):
+        m.pass_std_vector_int(obj)
+    if name == "dict_keys":
+        with pytest.raises(TypeError, match="incompatible function arguments"):
+            m.pass_std_set_int(obj)

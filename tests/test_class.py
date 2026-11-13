@@ -1,13 +1,56 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import gc
+import pickle
+import sys
+from unittest import mock
+
 import pytest
 
-import env  # noqa: F401
+import env
 from pybind11_tests import ConstructorStats, UserType
 from pybind11_tests import class_ as m
 
+UINT32MAX = 2**32 - 1
+
+
+def refcount_immortal(ob: object) -> int:
+    if _is_immortal := getattr(sys, "_is_immortal", None):
+        return UINT32MAX if _is_immortal(ob) else sys.getrefcount(ob)
+    return sys.getrefcount(ob)
+
+
+MANAGED_DICT_GET_REFERRERS_SUPPORTED = (
+    env.CPYTHON
+    and sys.version_info >= (3, 13, 13)
+    and (sys.version_info < (3, 14) or sys.version_info >= (3, 14, 4))
+)
+
+
+def test_obj_class_name():
+    expected_name = "UserType" if env.PYPY else "pybind11_tests.UserType"
+    assert m.obj_class_name(UserType(1)) == expected_name
+    assert m.obj_class_name(UserType) == expected_name
+
+
+def test_obj_class_name_python_subclass():
+    class Derived(UserType):
+        pass
+
+    # The first instance caches the type in pybind11's internals; the name must not change.
+    assert m.obj_class_name(Derived) == "Derived"
+    assert m.obj_class_name(Derived(1)) == "Derived"
+    assert m.obj_class_name(Derived) == "Derived"
+
+
+def test_obj_class_name_dotted():
+    name = "a[b.c]"
+    cls = getattr(m.class_names, name)
+    expected_name = name if env.PYPY else f"{m.class_names.__name__}.{name}"
+    assert m.obj_class_name(cls) == expected_name
+
 
 def test_repr():
-    # In Python 3.3+, repr() accesses __qualname__
     assert "pybind11_type" in repr(type(UserType))
     assert "UserType" in repr(UserType)
 
@@ -19,18 +62,45 @@ def test_instance(msg):
 
     instance = m.NoConstructor.new_instance()
 
+    if env.GRAALPY:
+        pytest.skip("ConstructorStats is incompatible with GraalPy.")
+
     cstats = ConstructorStats.get(m.NoConstructor)
     assert cstats.alive() == 1
     del instance
     assert cstats.alive() == 0
 
 
-def test_instance_new(msg):
+@pytest.mark.skipif(
+    not MANAGED_DICT_GET_REFERRERS_SUPPORTED,
+    reason="Requires CPython 3.13.13+ or 3.14.4+ managed dict traversal support",
+)
+def test_get_referrers():
+    instance = m.DynamicAttr()
+    instance.a = "test"
+    assert instance in gc.get_referrers(instance.__dict__)
+
+
+def test_instance_new():
     instance = m.NoConstructorNew()  # .__new__(m.NoConstructor.__class__)
+
+    if env.GRAALPY:
+        pytest.skip("ConstructorStats is incompatible with GraalPy.")
+
     cstats = ConstructorStats.get(m.NoConstructorNew)
     assert cstats.alive() == 1
     del instance
     assert cstats.alive() == 0
+
+
+def test_pass_unique_ptr():
+    obj = m.ToBeHeldByUniquePtr()
+    with pytest.raises(RuntimeError) as execinfo:
+        m.pass_unique_ptr(obj)
+    assert str(execinfo.value).startswith(
+        "Passing `std::unique_ptr<T>` from Python to C++ requires `py::class_<T, py::smart_holder>` (with T = "
+    )
+    assert "ToBeHeldByUniquePtr" in str(execinfo.value)
 
 
 def test_type():
@@ -103,8 +173,8 @@ def test_docstrings(doc):
 
 
 def test_qualname(doc):
-    """Tests that a properly qualified name is set in __qualname__ (even in pre-3.3, where we
-    backport the attribute) and that generated docstrings properly use it and the module name"""
+    """Tests that a properly qualified name is set in __qualname__ and that
+    generated docstrings properly use it and the module name"""
     assert m.NestBase.__qualname__ == "NestBase"
     assert m.NestBase.Nested.__qualname__ == "NestBase.Nested"
 
@@ -129,17 +199,89 @@ def test_qualname(doc):
     assert (
         doc(m.NestBase.Nested.fn)
         == """
-        fn(self: m.class_.NestBase.Nested, arg0: int, arg1: m.class_.NestBase, arg2: m.class_.NestBase.Nested) -> None
-    """  # noqa: E501 line too long
+        fn(self: m.class_.NestBase.Nested, arg0: typing.SupportsInt | typing.SupportsIndex, arg1: m.class_.NestBase, arg2: m.class_.NestBase.Nested) -> None
+    """
     )
     assert (
         doc(m.NestBase.Nested.fa)
         == """
-        fa(self: m.class_.NestBase.Nested, a: int, b: m.class_.NestBase, c: m.class_.NestBase.Nested) -> None
-    """  # noqa: E501 line too long
+        fa(self: m.class_.NestBase.Nested, a: typing.SupportsInt | typing.SupportsIndex, b: m.class_.NestBase, c: m.class_.NestBase.Nested) -> None
+    """
     )
     assert m.NestBase.__module__ == "pybind11_tests.class_"
     assert m.NestBase.Nested.__module__ == "pybind11_tests.class_"
+
+
+@pytest.mark.parametrize(
+    ("placement", "name"),
+    [
+        ("module", "Simple"),
+        ("module", "a.b"),
+        ("module", "a.b.c"),
+        ("module", "a[b]"),
+        ("module", "a[b.c]"),
+        ("module", "a.b[c]"),
+        ("nested", "a[b.c]"),
+        ("child", "Child"),
+        ("custom", "a[b.c]"),
+    ],
+)
+def test_class_names_match_type(request, placement, name):
+    """Bound classes follow Python's naming rules, including literal dots."""
+    if placement == "custom" and env.LIMITED_API:
+        pytest.skip("py::custom_type_setup is not available under Py_LIMITED_API")
+    scopes = {
+        "module": m.class_names,
+        "nested": m.NestBase,
+        "child": getattr(m.class_names, "a[b.c]"),
+        "custom": getattr(m.class_names, "custom", None),
+    }
+    scope = scopes[placement]
+    cls = getattr(scope, name)
+    module = scope.__name__ if isinstance(scope, type(m)) else scope.__module__
+    namespace = {"__module__": module}
+    if placement in {"nested", "child"}:
+        # type() needs an explicit qualified name for a dynamically nested class.
+        parent_name = "NestBase" if placement == "nested" else "a[b.c]"
+        parent = type(parent_name, (), {"__module__": module})
+        namespace["__qualname__"] = f"{parent.__qualname__}.{name}"
+    reference = type(name, (), namespace)
+    assert cls.__qualname__ == reference.__qualname__
+    assert cls.__module__ == reference.__module__
+    obj = cls()
+    assert obj.echo() is obj
+    assert f"{reference.__module__}.{reference.__qualname__}" in cls.echo.__doc__
+    if "." in name and (env.GRAALPY or (env.PYPY and sys.version_info >= (3, 12))):
+        request.applymarker(
+            pytest.mark.xfail(reason="The interpreter shortens dotted __name__")
+        )
+    assert cls.__name__ == reference.__name__
+    assert getattr(scope, cls.__name__) is cls
+
+
+@pytest.mark.skipif(
+    env.PYPY or env.GRAALPY, reason="Tests CPython's type creation paths"
+)
+def test_class_names_with_frozen_metaclass():
+    class FrozenNames(type(m.NestBase)):
+        def __setattr__(cls, name, value):
+            if name in {"__name__", "__qualname__"}:
+                raise TypeError("class names are frozen after creation")
+            super().__setattr__(name, value)
+
+    module_class, nested_class = m.class_names.bind_with_metaclass(
+        m.class_names, m.NestBase, FrozenNames
+    )
+    assert module_class.__name__ == "Frozen[pkg.Value]"
+    assert module_class.__qualname__ == "Frozen[pkg.Value]"
+    assert nested_class.__name__ == "FrozenInner"
+    assert nested_class.__qualname__ == "NestBase.FrozenInner"
+    for cls in (module_class, nested_class):
+        assert isinstance(cls, FrozenNames)
+        obj = cls()
+        assert obj.echo() is obj
+        with pytest.raises(TypeError, match="class names are frozen after creation"):
+            cls.__name__ = "Renamed"
 
 
 def test_inheritance(msg):
@@ -178,7 +320,6 @@ def test_inheritance(msg):
 
 
 def test_inheritance_init(msg):
-
     # Single base
     class Python(m.Pet):
         def __init__(self):
@@ -200,6 +341,156 @@ def test_inheritance_init(msg):
     assert msg(exc_info.value) == expected
 
 
+def test_new_bypasses_init():
+    """`__new__` allocates the Python object but not the C++ one; using the instance before
+    `__init__` has run must raise instead of segfaulting."""
+
+    class PythonDerived(m.NewNoInit):
+        pass
+
+    for cls in (m.NewNoInit, PythonDerived):
+        obj = cls.__new__(cls)
+        for use in (obj.data, obj.v_data, obj.__getstate__):
+            with pytest.raises(ValueError) as exc_info:
+                use()
+            assert "Python instance is uninitialized" in str(exc_info.value)
+            assert "NewNoInit" in str(exc_info.value)
+
+        # Calling `__init__()` is the sanctioned way to finish an object made with `__new__()`.
+        obj.__init__(42)
+        assert obj.data() == 42
+        assert obj.v_data() == 42
+
+
+def test_new_then_setstate():
+    """`__new__` must not be blocked: pickle relies on it, and `__setstate__` finishes the
+    object off. This walks the protocol by hand, then checks the real thing."""
+    real_obj = m.NewNoInit(42)
+    assert real_obj.data() == 42
+    state = real_obj.__getstate__()
+
+    obj = m.NewNoInit.__new__(m.NewNoInit)  # NEWOBJ
+    obj.__setstate__(state)  # BUILD
+    assert obj.data() == 42
+    assert obj.v_data() == 42
+
+    for protocol in range(2, pickle.HIGHEST_PROTOCOL + 1):
+        assert pickle.loads(pickle.dumps(m.NewNoInit(7), protocol)).v_data() == 7
+
+
+def test_failed_old_style_init_does_not_leave_lazy_storage():
+    """If an old-style placement-new `__init__` throws before constructing the value, the
+    lazily allocated storage must not linger: later use must still raise, not segfault."""
+    obj = m.OldStyleInit.__new__(m.OldStyleInit)
+    with pytest.raises(RuntimeError, match="negative data"):
+        obj.__init__(-1)
+
+    # The failed __init__ already lazily allocated storage for `self`, so without cleanup the
+    # uninitialized-instance guard never fires again and this reads a garbage vtable pointer.
+    with pytest.raises(ValueError, match="uninitialized"):
+        obj.v_data()
+
+    # A successful retry is still allowed.
+    obj.__init__(42)
+    assert obj.v_data() == 42
+
+
+def test_old_style_setstate_remains_supported():
+    """Deprecated placement-new `__setstate__` may still obtain storage inside its callback."""
+    obj = m.OldStyleInit.__new__(m.OldStyleInit)
+    obj.__setstate__(43)
+    assert obj.data() == 43
+
+
+def test_old_style_init_reentrant_load_current_limitation():
+    """The historical broad lazy-allocation window retained during an old-style constructor
+    chain can expose a pointer to unconstructed storage through a reentrant load."""
+    obj = m.OldStyleInit.__new__(m.OldStyleInit)
+    seen = {}
+
+    class LoadOnIndex:
+        def __index__(self):
+            # This pointer-only probe deliberately does not inspect or dereference the storage.
+            seen["exposed"] = m.expose_old_style_init_pointer(obj)
+            raise TypeError("stop the constructor")
+
+    with pytest.raises(TypeError):
+        obj.__init__(LoadOnIndex())
+
+    assert seen == {"exposed": True}
+
+    # Failure cleanup removes the raw storage, so subsequent ordinary loads are rejected and a
+    # normal initialization retry remains possible.
+    with pytest.raises(ValueError, match="uninitialized"):
+        m.expose_old_style_init_pointer(obj)
+    obj.__init__(44)
+    assert obj.data() == 44
+
+
+def test_old_style_init_cleans_multiple_inheritance_sibling_storage():
+    """The old-style compatibility window is instance-wide, so a reentrant load can lazily
+    allocate an unconstructed sibling base slot. Scope cleanup must reset that slot too."""
+
+    class Derived(m.OldStyleInit, m.NewNoInit):
+        pass
+
+    obj = Derived.__new__(Derived)
+    seen = {}
+
+    class LoadSiblingOnIndex:
+        def __index__(self):
+            # Deliberately obtain but do not dereference the sibling's unconstructed storage.
+            seen["exposed"] = m.expose_new_no_init_pointer(obj)
+            return 45
+
+    m.OldStyleInit.__init__(obj, LoadSiblingOnIndex())
+
+    assert seen == {"exposed": True}
+    assert m.OldStyleInit.data(obj) == 45
+    with pytest.raises(ValueError, match="uninitialized"):
+        m.expose_new_no_init_pointer(obj)
+
+    # The sibling slot remains usable after the old-style constructor returns.
+    m.NewNoInit.__init__(obj, 46)
+    assert m.OldStyleInit.data(obj) == 45
+    assert m.NewNoInit.data(obj) == 46
+
+
+def test_reentrant_load_during_new_style_init():
+    """New-style constructors never need lazy allocation, so passing the half-built instance
+    to another bound function while `__init__` runs must raise, not hand out garbage."""
+    obj = m.NewNoInit.__new__(m.NewNoInit)
+    seen = {}
+
+    class Evil:
+        def __index__(self):
+            # Runs during int conversion of a pure new-style constructor. Its chain has no
+            # compatibility window for lazy allocation.
+            try:
+                seen["data"] = obj.data()
+            except ValueError as exc:
+                seen["error"] = exc
+            raise TypeError("stop the constructor")
+
+    with pytest.raises(TypeError):
+        obj.__init__(Evil())
+
+    assert "data" not in seen, f"handed out uninitialized storage: {seen['data']!r}"
+    assert "error" in seen
+
+
+@pytest.mark.parametrize(
+    "mock_return_value", [None, (1, 2, 3), m.Pet("Polly", "parrot"), m.Dog("Molly")]
+)
+def test_mock_new(mock_return_value):
+    with mock.patch.object(
+        m.Pet, "__new__", return_value=mock_return_value
+    ) as mock_new:
+        obj = m.Pet("Noname", "Nospecies")
+    assert obj is mock_return_value
+    mock_new.assert_called_once_with(m.Pet, "Noname", "Nospecies")
+
+
 def test_automatic_upcasting():
     assert type(m.return_class_1()).__name__ == "DerivedClass1"
     assert type(m.return_class_2()).__name__ == "DerivedClass2"
@@ -215,7 +506,7 @@ def test_automatic_upcasting():
 
 
 def test_isinstance():
-    objects = [tuple(), dict(), m.Pet("Polly", "parrot")] + [m.Dog("Molly")] * 4
+    objects = [(), {}, m.Pet("Polly", "parrot")] + [m.Dog("Molly")] * 4
     expected = (True, True, True, True, True, False, False)
     assert m.check_instances(objects) == expected
 
@@ -315,6 +606,8 @@ def test_bind_protected_functions():
 
     b = m.ProtectedB()
     assert b.foo() == 42
+    assert m.read_foo(b.void_foo()) == 42
+    assert m.pointers_equal(b.get_self(), b)
 
     class C(m.ProtectedB):
         def __init__(self):
@@ -340,25 +633,27 @@ def test_brace_initialization():
     assert b.vec == [123, 456]
 
 
-@pytest.mark.xfail("env.PYPY")
+@pytest.mark.xfail("env.PYPY or env.GRAALPY")
 def test_class_refcount():
     """Instances must correctly increase/decrease the reference count of their types (#1029)"""
-    from sys import getrefcount
 
     class PyDog(m.Dog):
         pass
 
     for cls in m.Dog, PyDog:
-        refcount_1 = getrefcount(cls)
+        refcount_1 = refcount_immortal(cls)
         molly = [cls("Molly") for _ in range(10)]
-        refcount_2 = getrefcount(cls)
+        refcount_2 = refcount_immortal(cls)
 
         del molly
         pytest.gc_collect()
-        refcount_3 = getrefcount(cls)
+        refcount_3 = refcount_immortal(cls)
 
+        # Python may report a large value here (above 30 bits), that's also fine
         assert refcount_1 == refcount_3
-        assert refcount_2 > refcount_1
+        assert (refcount_2 > refcount_1) or (
+            refcount_2 == refcount_1 and refcount_1 >= 2**29
+        )
 
 
 def test_reentrant_implicit_conversion_failure(msg):
@@ -416,10 +711,12 @@ def test_non_final_final():
 def test_exception_rvalue_abort():
     with pytest.raises(RuntimeError):
         m.PyPrintDestructor().throw_something()
+    # The destructor calls Python; on PyPy, a later GC at an arbitrary point can abort
+    pytest.gc_collect()
 
 
 # https://github.com/pybind/pybind11/issues/1568
-def test_multiple_instances_with_same_pointer(capture):
+def test_multiple_instances_with_same_pointer():
     n = 100
     instances = [m.SamePointer() for _ in range(n)]
     for i in range(n):
@@ -471,3 +768,38 @@ def test_register_duplicate_class():
         m.register_duplicate_nested_class_type(ClassScope)
     expected = 'generic_type: type "YetAnotherDuplicateNested" is already registered!'
     assert str(exc_info.value) == expected
+
+
+def test_pr4220_tripped_over_this():
+    assert (
+        m.Empty0().get_msg()
+        == "This is really only meant to exercise successful compilation."
+    )
+
+
+@pytest.mark.skipif(sys.platform.startswith("emscripten"), reason="Requires threads")
+def test_all_type_info_multithreaded():
+    # See PR #5419 for background.
+    import threading
+
+    from pybind11_tests import TestContext
+
+    class Context(TestContext):
+        pass
+
+    num_runs = 10
+    num_threads = 4
+    barrier = threading.Barrier(num_threads)
+
+    def func():
+        barrier.wait()
+        with Context():
+            pass
+
+    for _ in range(num_runs):
+        threads = [threading.Thread(target=func) for _ in range(num_threads)]
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join()

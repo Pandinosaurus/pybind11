@@ -17,6 +17,10 @@ converted (i.e. copied) on every Python->C++ and C++->Python transition, which
 can have implications on the program semantics and performance. Please read the
 next sections for more details and alternative approaches that avoid this.
 
+Copying the container does not make non-owning element types own their data.
+In particular, containers of C++ string views have additional
+:ref:`string_view_lifetime` requirements.
+
 .. note::
 
     Arbitrary nesting of any of these types is possible.
@@ -42,7 +46,7 @@ types:
 .. code-block:: cpp
 
     // `boost::optional` as an example -- can be any `std::optional`-like container
-    namespace pybind11 { namespace detail {
+    namespace PYBIND11_NAMESPACE { namespace detail {
         template <typename T>
         struct type_caster<boost::optional<T>> : optional_caster<boost::optional<T>> {};
     }}
@@ -54,7 +58,7 @@ for custom variant types:
 .. code-block:: cpp
 
     // `boost::variant` as an example -- can be any `std::variant`-like container
-    namespace pybind11 { namespace detail {
+    namespace PYBIND11_NAMESPACE { namespace detail {
         template <typename... Ts>
         struct type_caster<boost::variant<Ts...>> : variant_caster<boost::variant<Ts...>> {};
 
@@ -66,7 +70,7 @@ for custom variant types:
                 return boost::apply_visitor(args...);
             }
         };
-    }} // namespace pybind11::detail
+    }} // namespace PYBIND11_NAMESPACE::detail
 
 The ``visit_helper`` specialization is not required if your ``name::variant`` provides
 a ``name::visit()`` function. For any other function name, the specialization must be
@@ -87,8 +91,6 @@ included to tell pybind11 how to visit the variant.
 
     pybind11 only supports the modern implementation of ``boost::variant``
     which makes use of variadic templates. This requires Boost 1.56 or newer.
-    Additionally, on Windows, MSVC 2017 is required because ``boost::variant``
-    falls back to the old non-variadic implementation on MSVC 2015.
 
 .. _opaque:
 
@@ -164,15 +166,15 @@ the declaration
 
 .. code-block:: cpp
 
-    PYBIND11_MAKE_OPAQUE(std::vector<int>);
+    PYBIND11_MAKE_OPAQUE(std::vector<int>)
 
 before any binding code (e.g. invocations to ``class_::def()``, etc.). This
 macro must be specified at the top level (and outside of any namespaces), since
 it adds a template instantiation of ``type_caster``. If your binding code consists of
 multiple compilation units, it must be present in every file (typically via a
 common header) preceding any usage of ``std::vector<int>``. Opaque types must
-also have a corresponding ``class_`` declaration to associate them with a name
-in Python, and to define a set of available operations, e.g.:
+also have a corresponding ``py::class_`` declaration to associate them with a
+name in Python, and to define a set of available operations, e.g.:
 
 .. code-block:: cpp
 
@@ -209,8 +211,8 @@ The following example showcases usage of :file:`pybind11/stl_bind.h`:
     // Don't forget this
     #include <pybind11/stl_bind.h>
 
-    PYBIND11_MAKE_OPAQUE(std::vector<int>);
-    PYBIND11_MAKE_OPAQUE(std::map<std::string, double>);
+    PYBIND11_MAKE_OPAQUE(std::vector<int>)
+    PYBIND11_MAKE_OPAQUE(std::map<std::string, double>)
 
     // ...
 

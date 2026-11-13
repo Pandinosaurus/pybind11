@@ -1,7 +1,9 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import sys
+
 import pytest
 
-import env
 from pybind11_tests import stl_binders as m
 
 
@@ -67,6 +69,40 @@ def test_vector_int():
     assert len(v_int2) == 0
 
 
+@pytest.mark.parametrize(
+    "s",
+    [
+        slice(1, 4),
+        slice(None, None, 2),
+        slice(1, None, 2),
+        slice(None, None, -1),
+        slice(None, None, -2),
+        slice(3, 1, -1),
+        slice(2, 2),
+        slice(None),
+        slice(5, 0, -2),
+        slice(-3, -1),
+        slice(None, None, -3),
+        slice(3, None, sys.maxsize),
+        slice(-2, -7, -2),
+    ],
+)
+def test_vector_delitem_slice(s):
+    for n in range(8):
+        ref = list(range(n))
+        got = m.VectorInt(range(n))
+        del ref[s]
+        del got[s]
+        assert list(got) == ref, f"n={n}"
+
+
+def test_vector_delitem_slice_step_zero():
+    v = m.VectorInt(range(8))
+    with pytest.raises(ValueError):
+        del v[::0]
+    assert list(v) == list(range(8))
+
+
 # Older PyPy's failed here, related to the PyPy's buffer protocol.
 def test_vector_buffer():
     b = bytearray([1, 2, 3, 4])
@@ -74,18 +110,13 @@ def test_vector_buffer():
     assert v[1] == 2
     v[2] = 5
     mv = memoryview(v)  # We expose the buffer interface
-    if not env.PY2:
-        assert mv[2] == 5
-        mv[2] = 6
-    else:
-        assert mv[2] == "\x05"
-        mv[2] = "\x06"
+    assert mv[2] == 5
+    mv[2] = 6
     assert v[2] == 6
 
-    if not env.PY2:
-        mv = memoryview(b)
-        v = m.VectorUChar(mv[::2])
-        assert v[1] == 3
+    mv = memoryview(b)
+    v = m.VectorUChar(mv[::2])
+    assert v[1] == 3
 
     with pytest.raises(RuntimeError) as excinfo:
         m.create_undeclstruct()  # Undeclared struct contents, no buffer interface
@@ -109,6 +140,14 @@ def test_vector_buffer_numpy():
     v = m.VectorInt(a[:, 1])
     assert len(v) == 3
     assert v[2] == 10
+
+    # Zero stride: every element is backed by the same item.
+    v = m.VectorInt(np.broadcast_to(np.array(7, dtype=np.uintc), (3,)))
+    assert list(v) == [7, 7, 7]
+
+    # Negative stride.
+    v = m.VectorInt(a[0, ::-1])
+    assert list(v) == [4, 3, 2, 1]
 
     v = m.get_vectorstruct()
     assert v[0].x == 5
@@ -193,9 +232,9 @@ def test_map_string_double():
     um["ua"] = 1.1
     um["ub"] = 2.6
 
-    assert sorted(list(um)) == ["ua", "ub"]
+    assert sorted(um) == ["ua", "ub"]
     assert list(um.keys()) == list(um)
-    assert sorted(list(um.items())) == [("ua", 1.1), ("ub", 2.6)]
+    assert sorted(um.items()) == [("ua", 1.1), ("ub", 2.6)]
     assert list(zip(um.keys(), um.values())) == list(um.items())
     assert "UnorderedMapStringDouble" in str(um)
 
@@ -216,7 +255,7 @@ def test_map_string_double_const():
 def test_noncopyable_containers():
     # std::vector
     vnc = m.get_vnc(5)
-    for i in range(0, 5):
+    for i in range(5):
         assert vnc[i].value == i + 1
 
     for i, j in enumerate(vnc, start=1):
@@ -224,7 +263,7 @@ def test_noncopyable_containers():
 
     # std::deque
     dnc = m.get_dnc(5)
-    for i in range(0, 5):
+    for i in range(5):
         assert dnc[i].value == i + 1
 
     i = 1
@@ -259,11 +298,11 @@ def test_noncopyable_containers():
     # nested std::map<std::vector>
     nvnc = m.get_nvnc(5)
     for i in range(1, 6):
-        for j in range(0, 5):
+        for j in range(5):
             assert nvnc[i][j].value == j + 1
 
     # Note: maps do not have .values()
-    for _, v in nvnc.items():
+    for v in nvnc.values():
         for i, j in enumerate(v, start=1):
             assert j.value == i
 
@@ -274,7 +313,7 @@ def test_noncopyable_containers():
             assert nmnc[i][j].value == 10 * j
 
     vsum = 0
-    for _, v_o in nmnc.items():
+    for v_o in nmnc.values():
         for k_i, v_i in v_o.items():
             assert v_i.value == 10 * k_i
             vsum += v_i.value
@@ -288,7 +327,7 @@ def test_noncopyable_containers():
             assert numnc[i][j].value == 10 * j
 
     vsum = 0
-    for _, v_o in numnc.items():
+    for v_o in numnc.values():
         for k_i, v_i in v_o.items():
             assert v_i.value == 10 * k_i
             vsum += v_i.value
@@ -307,12 +346,113 @@ def test_map_delitem():
     assert list(mm) == ["b"]
     assert list(mm.items()) == [("b", 2.5)]
 
+    with pytest.raises(KeyError) as excinfo:
+        mm["a_long_key"]
+    assert "a_long_key" in str(excinfo.value)
+
+    with pytest.raises(KeyError) as excinfo:
+        del mm["a_long_key"]
+    assert "a_long_key" in str(excinfo.value)
+
+    cut_length = 100
+    k_very_long = "ab" * cut_length + "xyz"
+    with pytest.raises(KeyError) as excinfo:
+        mm[k_very_long]
+    assert k_very_long in str(excinfo.value)
+    k_very_long += "@"
+    with pytest.raises(KeyError) as excinfo:
+        mm[k_very_long]
+    k_repr = k_very_long[:cut_length] + "✄✄✄" + k_very_long[-cut_length:]
+    assert k_repr in str(excinfo.value)
+
     um = m.UnorderedMapStringDouble()
     um["ua"] = 1.1
     um["ub"] = 2.6
 
-    assert sorted(list(um)) == ["ua", "ub"]
-    assert sorted(list(um.items())) == [("ua", 1.1), ("ub", 2.6)]
+    assert sorted(um) == ["ua", "ub"]
+    assert sorted(um.items()) == [("ua", 1.1), ("ub", 2.6)]
     del um["ua"]
-    assert sorted(list(um)) == ["ub"]
-    assert sorted(list(um.items())) == [("ub", 2.6)]
+    assert sorted(um) == ["ub"]
+    assert sorted(um.items()) == [("ub", 2.6)]
+
+
+def test_map_view_types():
+    map_string_double = m.MapStringDouble()
+    unordered_map_string_double = m.UnorderedMapStringDouble()
+    map_string_double_const = m.MapStringDoubleConst()
+    unordered_map_string_double_const = m.UnorderedMapStringDoubleConst()
+
+    assert map_string_double.keys().__class__.__name__ == "KeysView"
+    assert map_string_double.values().__class__.__name__ == "ValuesView"
+    assert map_string_double.items().__class__.__name__ == "ItemsView"
+
+    keys_type = type(map_string_double.keys())
+    assert type(unordered_map_string_double.keys()) is keys_type
+    assert type(map_string_double_const.keys()) is keys_type
+    assert type(unordered_map_string_double_const.keys()) is keys_type
+
+    values_type = type(map_string_double.values())
+    assert type(unordered_map_string_double.values()) is values_type
+    assert type(map_string_double_const.values()) is values_type
+    assert type(unordered_map_string_double_const.values()) is values_type
+
+    items_type = type(map_string_double.items())
+    assert type(unordered_map_string_double.items()) is items_type
+    assert type(map_string_double_const.items()) is items_type
+    assert type(unordered_map_string_double_const.items()) is items_type
+
+    map_string_float = m.MapStringFloat()
+    unordered_map_string_float = m.UnorderedMapStringFloat()
+
+    assert type(map_string_float.keys()) is keys_type
+    assert type(unordered_map_string_float.keys()) is keys_type
+    assert type(map_string_float.values()) is values_type
+    assert type(unordered_map_string_float.values()) is values_type
+    assert type(map_string_float.items()) is items_type
+    assert type(unordered_map_string_float.items()) is items_type
+
+    map_pair_double_int_int32 = m.MapPairDoubleIntInt32()
+    map_pair_double_int_int64 = m.MapPairDoubleIntInt64()
+
+    assert type(map_pair_double_int_int32.values()) is values_type
+    assert type(map_pair_double_int_int64.values()) is values_type
+
+    map_int_object = m.MapIntObject()
+    map_string_object = m.MapStringObject()
+
+    assert type(map_int_object.keys()) is keys_type
+    assert type(map_string_object.keys()) is keys_type
+    assert type(map_int_object.items()) is items_type
+    assert type(map_string_object.items()) is items_type
+
+
+def test_recursive_vector():
+    recursive_vector = m.RecursiveVector()
+    recursive_vector.append(m.RecursiveVector())
+    recursive_vector[0].append(m.RecursiveVector())
+    recursive_vector[0].append(m.RecursiveVector())
+    # Can't use len() since test_stl_binders.cpp does not include stl.h,
+    # so the necessary conversion is missing
+    assert recursive_vector[0].count(m.RecursiveVector()) == 2
+
+
+def test_recursive_map():
+    recursive_map = m.RecursiveMap()
+    recursive_map[100] = m.RecursiveMap()
+    recursive_map[100][101] = m.RecursiveMap()
+    recursive_map[100][102] = m.RecursiveMap()
+    assert list(recursive_map[100].keys()) == [101, 102]
+
+
+def test_user_vector_like():
+    vec = m.UserVectorLike()
+    vec.append(2)
+    assert vec[0] == 2
+    assert len(vec) == 1
+
+
+def test_user_like_map():
+    map = m.UserMapLike()
+    map[33] = 44
+    assert map[33] == 44
+    assert len(map) == 1

@@ -5,13 +5,7 @@
 # All rights reserved. Use of this source code is governed by a
 # BSD-style license that can be found in the LICENSE file.
 
-# include_guard(global) (pre-CMake 3.10)
-if(TARGET pybind11::python_headers)
-  return()
-endif()
-
-# Built-in in CMake 3.5+
-include(CMakeParseArguments)
+include_guard(DIRECTORY)
 
 if(pybind11_FIND_QUIETLY)
   set(_pybind11_quiet QUIET)
@@ -43,7 +37,7 @@ endif()
 
 # A user can set versions manually too
 set(Python_ADDITIONAL_VERSIONS
-    "3.11;3.10;3.9;3.8;3.7;3.6;3.5;3.4"
+    "3.15;3.14;3.13;3.12;3.11;3.10;3.9"
     CACHE INTERNAL "")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
@@ -65,6 +59,7 @@ _pybind11_promote_to_cache(PYTHON_INCLUDE_DIRS)
 _pybind11_promote_to_cache(PYTHON_LIBRARIES)
 _pybind11_promote_to_cache(PYTHON_MODULE_PREFIX)
 _pybind11_promote_to_cache(PYTHON_MODULE_EXTENSION)
+_pybind11_promote_to_cache(PYTHON_MODULE_DEBUG_POSTFIX)
 _pybind11_promote_to_cache(PYTHON_VERSION_MAJOR)
 _pybind11_promote_to_cache(PYTHON_VERSION_MINOR)
 _pybind11_promote_to_cache(PYTHON_VERSION)
@@ -105,8 +100,8 @@ set(pybind11_INCLUDE_DIRS
     "${pybind11_INCLUDE_DIR}" "${PYTHON_INCLUDE_DIRS}"
     CACHE INTERNAL "Directories where pybind11 and possibly Python headers are located")
 
-# Python debug libraries expose slightly different objects before 3.8
-# https://docs.python.org/3.6/c-api/intro.html#debugging-builds
+# A debug build of Python needs Py_DEBUG to select the matching ABI.
+# https://docs.python.org/3/c-api/intro.html#debugging-builds
 # https://stackoverflow.com/questions/39161202/how-to-work-around-missing-pymodule-create2-in-amd64-win-python35-d-lib
 if(PYTHON_IS_DEBUG)
   set_property(
@@ -115,29 +110,28 @@ if(PYTHON_IS_DEBUG)
     PROPERTY INTERFACE_COMPILE_DEFINITIONS Py_DEBUG)
 endif()
 
-set_property(
-  TARGET pybind11::module
-  APPEND
-  PROPERTY
-    INTERFACE_LINK_LIBRARIES pybind11::python_link_helper
-    "$<$<OR:$<PLATFORM_ID:Windows>,$<PLATFORM_ID:Cygwin>>:$<BUILD_INTERFACE:${PYTHON_LIBRARIES}>>")
+# The IMPORTED INTERFACE library here is to ensure that "debug" and "release" get processed outside
+# of a generator expression - https://gitlab.kitware.com/cmake/cmake/-/issues/18424, as they are
+# target_link_library keywords rather than real libraries.
+add_library(pybind11::_ClassicPythonLibraries IMPORTED INTERFACE)
+target_link_libraries(pybind11::_ClassicPythonLibraries INTERFACE ${PYTHON_LIBRARIES})
+target_link_libraries(
+  pybind11::module
+  INTERFACE
+    pybind11::python_link_helper
+    "$<$<OR:$<PLATFORM_ID:Windows>,$<PLATFORM_ID:Cygwin>,$<PLATFORM_ID:Android>>:pybind11::_ClassicPythonLibraries>"
+)
 
-if(PYTHON_VERSION VERSION_LESS 3)
-  set_property(
-    TARGET pybind11::pybind11
-    APPEND
-    PROPERTY INTERFACE_LINK_LIBRARIES pybind11::python2_no_register)
-endif()
-
-set_property(
-  TARGET pybind11::embed
-  APPEND
-  PROPERTY INTERFACE_LINK_LIBRARIES pybind11::pybind11 $<BUILD_INTERFACE:${PYTHON_LIBRARIES}>)
+target_link_libraries(pybind11::embed INTERFACE pybind11::pybind11
+                                                pybind11::_ClassicPythonLibraries)
 
 function(pybind11_extension name)
   # The prefix and extension are provided by FindPythonLibsNew.cmake
-  set_target_properties(${name} PROPERTIES PREFIX "${PYTHON_MODULE_PREFIX}"
-                                           SUFFIX "${PYTHON_MODULE_EXTENSION}")
+  set_target_properties(
+    ${name}
+    PROPERTIES PREFIX "${PYTHON_MODULE_PREFIX}"
+               DEBUG_POSTFIX "${PYTHON_MODULE_DEBUG_POSTFIX}"
+               SUFFIX "${PYTHON_MODULE_EXTENSION}")
 endfunction()
 
 # Build a Python extension module:
@@ -145,8 +139,17 @@ endfunction()
 #                     [NO_EXTRAS] [THIN_LTO] [OPT_SIZE] source1 [source2 ...])
 #
 function(pybind11_add_module target_name)
-  set(options "MODULE;SHARED;EXCLUDE_FROM_ALL;NO_EXTRAS;SYSTEM;THIN_LTO;OPT_SIZE")
+  set(options
+      "MODULE;SHARED;EXCLUDE_FROM_ALL;NO_EXTRAS;SYSTEM;THIN_LTO;OPT_SIZE;PRECOMPILE;NO_PRECOMPILE;STABLE_ABI;NO_STABLE_ABI"
+  )
   cmake_parse_arguments(ARG "${options}" "" "" ${ARGN})
+
+  if((ARG_STABLE_ABI OR PYBIND11_STABLE_ABI) AND NOT ARG_NO_STABLE_ABI)
+    message(
+      FATAL_ERROR
+        "${target_name}: STABLE_ABI requires the FindPython mode (PYBIND11_FINDPYTHON=ON) "
+        "and CMake 3.26 or newer.")
+  endif()
 
   if(ARG_MODULE AND ARG_SHARED)
     message(FATAL_ERROR "Can't be both MODULE and SHARED")
@@ -166,6 +169,8 @@ function(pybind11_add_module target_name)
 
   target_link_libraries(${target_name} PRIVATE pybind11::module)
 
+  _pybind11_maybe_precompile(${target_name} "${ARG_PRECOMPILE}" "${ARG_NO_PRECOMPILE}" OFF)
+
   if(ARG_SYSTEM)
     message(
       STATUS
@@ -175,18 +180,7 @@ function(pybind11_add_module target_name)
 
   pybind11_extension(${target_name})
 
-  # -fvisibility=hidden is required to allow multiple modules compiled against
-  # different pybind versions to work properly, and for some features (e.g.
-  # py::module_local).  We force it on everything inside the `pybind11`
-  # namespace; also turning it on for a pybind module compilation here avoids
-  # potential warnings or issues from having mixed hidden/non-hidden types.
-  if(NOT DEFINED CMAKE_CXX_VISIBILITY_PRESET)
-    set_target_properties(${target_name} PROPERTIES CXX_VISIBILITY_PRESET "hidden")
-  endif()
-
-  if(NOT DEFINED CMAKE_CUDA_VISIBILITY_PRESET)
-    set_target_properties(${target_name} PROPERTIES CUDA_VISIBILITY_PRESET "hidden")
-  endif()
+  _pybind11_default_hidden_visibility(${target_name})
 
   if(ARG_NO_EXTRAS)
     return()
@@ -200,8 +194,12 @@ function(pybind11_add_module target_name)
     endif()
   endif()
 
-  if(NOT MSVC AND NOT ${CMAKE_BUILD_TYPE} MATCHES Debug|RelWithDebInfo)
-    pybind11_strip(${target_name})
+  if(DEFINED CMAKE_BUILD_TYPE) # see https://github.com/pybind/pybind11/issues/4454
+    # Use case-insensitive comparison to match the result of $<CONFIG:cfgs>
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" uppercase_CMAKE_BUILD_TYPE)
+    if(NOT MSVC AND NOT "${uppercase_CMAKE_BUILD_TYPE}" MATCHES DEBUG|RELWITHDEBINFO|NONE)
+      pybind11_strip(${target_name})
+    endif()
   endif()
 
   if(MSVC)

@@ -1,4 +1,5 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import os
 
 import pytest
@@ -18,12 +19,16 @@ def test_evals(capture):
     assert m.test_eval_failure()
 
 
-@pytest.mark.xfail("env.PYPY and not env.PY2", raises=RuntimeError)
+@pytest.mark.xfail("env.PYPY or env.GRAALPY", raises=RuntimeError)
 def test_eval_file():
     filename = os.path.join(os.path.dirname(__file__), "test_eval_call.py")
     assert m.test_eval_file(filename)
 
     assert m.test_eval_file_failure()
+
+
+def test_eval_line_numbers():
+    assert m.test_eval_line_numbers() == (2, 2)
 
 
 def test_eval_empty_globals():

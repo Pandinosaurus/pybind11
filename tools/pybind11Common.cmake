@@ -2,13 +2,12 @@
 
 Adds the following targets::
 
-    pybind11::pybind11 - link to headers and pybind11
+    pybind11::pybind11 - link to Python headers and pybind11::headers
     pybind11::module - Adds module links
     pybind11::embed - Adds embed links
-    pybind11::lto - Link time optimizations (manual selection)
-    pybind11::thin_lto - Link time optimizations (manual selection)
+    pybind11::lto - Link time optimizations (only if CMAKE_INTERPROCEDURAL_OPTIMIZATION is not set)
+    pybind11::thin_lto - Link time optimizations (only if CMAKE_INTERPROCEDURAL_OPTIMIZATION is not set)
     pybind11::python_link_helper - Adds link to Python libraries
-    pybind11::python2_no_register - Avoid warning/error with Python 2 + C++14/7
     pybind11::windows_extras - MSVC bigobj and mp for building multithreaded
     pybind11::opt_size - avoid optimizations that increase code size
 
@@ -19,12 +18,6 @@ Adds the following functions::
 
 #]======================================================]
 
-# CMake 3.10 has an include_guard command, but we can't use that yet
-# include_guard(global) (pre-CMake 3.10)
-if(TARGET pybind11::lto)
-  return()
-endif()
-
 # If we are in subdirectory mode, all IMPORTED targets must be GLOBAL. If we
 # are in CONFIG mode, they should be "normal" targets instead.
 # In CMake 3.11+ you can promote a target to global after you create it,
@@ -33,8 +26,13 @@ get_property(
   is_config
   TARGET pybind11::headers
   PROPERTY IMPORTED)
+
 if(NOT is_config)
+  include_guard(GLOBAL)
   set(optional_global GLOBAL)
+else()
+  include_guard(DIRECTORY)
+  set(optional_global "")
 endif()
 
 # If not run in Python mode, we still would like this to at least
@@ -42,6 +40,32 @@ endif()
 set(pybind11_INCLUDE_DIRS
     "${pybind11_INCLUDE_DIR}"
     CACHE INTERNAL "Include directory for pybind11 (Python not requested)")
+
+# CMP0190 prohibits calling FindPython with both Interpreter and Development components
+# when cross-compiling, unless the CMAKE_CROSSCOMPILING_EMULATOR variable is defined.
+# Default PYBIND11_USE_CROSSCOMPILING to ON in that case, but never override a value the
+# project set explicitly (e.g. Emscripten/Pyodide defines an emulator yet still wants it ON).
+# PYBIND11_USE_CROSSCOMPILING is undefined for find_package() consumers, but our own
+# CMakeLists.txt always defines it via option(); _PYBIND11_USE_CROSSCOMPILING_DEFAULTED tells
+# us whether that came from the project or from the option() default.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.1"
+   AND NOT DEFINED CMAKE_CROSSCOMPILING_EMULATOR
+   AND (NOT DEFINED PYBIND11_USE_CROSSCOMPILING OR _PYBIND11_USE_CROSSCOMPILING_DEFAULTED))
+  cmake_policy(GET CMP0190 _pybind11_cmp0190)
+  if(_pybind11_cmp0190 STREQUAL "NEW")
+    set(PYBIND11_USE_CROSSCOMPILING "ON")
+  endif()
+endif()
+
+if(CMAKE_CROSSCOMPILING AND PYBIND11_USE_CROSSCOMPILING)
+  set(_PYBIND11_CROSSCOMPILING
+      ON
+      CACHE INTERNAL "")
+else()
+  set(_PYBIND11_CROSSCOMPILING
+      OFF
+      CACHE INTERNAL "")
+endif()
 
 # --------------------- Shared targets ----------------------------
 
@@ -66,51 +90,37 @@ set_property(
   APPEND
   PROPERTY INTERFACE_LINK_LIBRARIES pybind11::pybind11)
 
-# ----------------------- no register ----------------------
+# -------------- emscripten requires exceptions enabled -------------
+# _pybind11_no_exceptions is a private mechanism to disable this addition.
+# Please open an issue if you need to use it; it will be removed if no one
+# needs it.
+if(CMAKE_SYSTEM_NAME MATCHES Emscripten AND NOT _pybind11_no_exceptions)
+  if(is_config)
+    set(_tmp_config_target pybind11::pybind11_headers)
+  else()
+    set(_tmp_config_target pybind11_headers)
+  endif()
 
-# Workaround for Python 2.7 and C++17 (C++14 as a warning) incompatibility
-# This adds the flags -Wno-register and -Wno-deprecated-register if the compiler
-# is Clang 3.9+ or AppleClang and the compile language is CXX, or /wd5033 for MSVC (all languages,
-# since MSVC didn't recognize COMPILE_LANGUAGE until CMake 3.11+).
-
-add_library(pybind11::python2_no_register INTERFACE IMPORTED ${optional_global})
-set(clang_4plus
-    "$<AND:$<CXX_COMPILER_ID:Clang>,$<NOT:$<VERSION_LESS:$<CXX_COMPILER_VERSION>,3.9>>>")
-set(no_register "$<OR:${clang_4plus},$<CXX_COMPILER_ID:AppleClang>>")
-
-if(MSVC AND CMAKE_VERSION VERSION_LESS 3.11)
-  set(cxx_no_register "${no_register}")
-else()
-  set(cxx_no_register "$<AND:$<COMPILE_LANGUAGE:CXX>,${no_register}>")
+  set_property(
+    TARGET ${_tmp_config_target}
+    APPEND
+    PROPERTY INTERFACE_LINK_OPTIONS -fexceptions)
+  set_property(
+    TARGET ${_tmp_config_target}
+    APPEND
+    PROPERTY INTERFACE_COMPILE_OPTIONS -fexceptions)
+  unset(_tmp_config_target)
 endif()
-
-set(msvc "$<CXX_COMPILER_ID:MSVC>")
-
-set_property(
-  TARGET pybind11::python2_no_register
-  PROPERTY INTERFACE_COMPILE_OPTIONS
-           "$<${cxx_no_register}:-Wno-register;-Wno-deprecated-register>" "$<${msvc}:/wd5033>")
 
 # --------------------------- link helper ---------------------------
 
 add_library(pybind11::python_link_helper IMPORTED INTERFACE ${optional_global})
 
-if(CMAKE_VERSION VERSION_LESS 3.13)
-  # In CMake 3.11+, you can set INTERFACE properties via the normal methods, and
-  # this would be simpler.
-  set_property(
-    TARGET pybind11::python_link_helper
-    APPEND
-    PROPERTY INTERFACE_LINK_LIBRARIES "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>")
-else()
-  # link_options was added in 3.13+
-  # This is safer, because you are ensured the deduplication pass in CMake will not consider
-  # these separate and remove one but not the other.
-  set_property(
-    TARGET pybind11::python_link_helper
-    APPEND
-    PROPERTY INTERFACE_LINK_OPTIONS "$<$<PLATFORM_ID:Darwin>:LINKER:-undefined,dynamic_lookup>")
-endif()
+set_property(
+  TARGET pybind11::python_link_helper
+  APPEND
+  PROPERTY INTERFACE_LINK_OPTIONS
+           "$<$<PLATFORM_ID:Darwin,iOS,tvOS,watchOS,visionOS>:LINKER:-undefined,dynamic_lookup>")
 
 # ------------------------ Windows extras -------------------------
 
@@ -122,26 +132,18 @@ if(MSVC) # That's also clang-cl
   set_property(
     TARGET pybind11::windows_extras
     APPEND
-    PROPERTY INTERFACE_COMPILE_OPTIONS /bigobj)
+    PROPERTY INTERFACE_COMPILE_OPTIONS $<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
 
   # /MP enables multithreaded builds (relevant when there are many files) for MSVC
   if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC") # no Clang no Intel
-    if(CMAKE_VERSION VERSION_LESS 3.11)
-      set_property(
-        TARGET pybind11::windows_extras
-        APPEND
-        PROPERTY INTERFACE_COMPILE_OPTIONS $<$<NOT:$<CONFIG:Debug>>:/MP>)
-    else()
-      # Only set these options for C++ files.  This is important so that, for
-      # instance, projects that include other types of source files like CUDA
-      # .cu files don't get these options propagated to nvcc since that would
-      # cause the build to fail.
-      set_property(
-        TARGET pybind11::windows_extras
-        APPEND
-        PROPERTY INTERFACE_COMPILE_OPTIONS
-                 $<$<NOT:$<CONFIG:Debug>>:$<$<COMPILE_LANGUAGE:CXX>:/MP>>)
-    endif()
+    # Only set these options for C++ files.  This is important so that, for
+    # instance, projects that include other types of source files like CUDA
+    # .cu files don't get these options propagated to nvcc since that would
+    # cause the build to fail.
+    set_property(
+      TARGET pybind11::windows_extras
+      APPEND
+      PROPERTY INTERFACE_COMPILE_OPTIONS $<$<NOT:$<CONFIG:Debug>>:$<$<COMPILE_LANGUAGE:CXX>:/MP>>)
   endif()
 endif()
 
@@ -189,16 +191,51 @@ endif()
 
 # --------------------- Python specifics -------------------------
 
+# CMake 3.27 removes the classic FindPythonInterp if CMP0148 is NEW
+if(CMAKE_VERSION VERSION_LESS "3.27")
+  set(_pybind11_missing_old_python "OLD")
+else()
+  cmake_policy(GET CMP0148 _pybind11_missing_old_python)
+endif()
+
 # Check to see which Python mode we are in, new, old, or no python
 if(PYBIND11_NOPYTHON)
   set(_pybind11_nopython ON)
+  # We won't use new FindPython if PYBIND11_FINDPYTHON is defined and falselike
+  # Otherwise, we use if FindPythonLibs is missing or if FindPython was already used
 elseif(
-  PYBIND11_FINDPYTHON
-  OR Python_FOUND
-  OR Python2_FOUND
-  OR Python3_FOUND)
+  (NOT DEFINED PYBIND11_FINDPYTHON
+   OR PYBIND11_FINDPYTHON STREQUAL "COMPAT"
+   OR PYBIND11_FINDPYTHON)
+  AND (_pybind11_missing_old_python STREQUAL "NEW"
+       OR PYBIND11_FINDPYTHON STREQUAL "COMPAT"
+       OR PYBIND11_FINDPYTHON
+       OR Python_FOUND
+       OR Python3_FOUND
+      ))
+
   # New mode
-  include("${CMAKE_CURRENT_LIST_DIR}/pybind11NewTools.cmake")
+  if(Python_FOUND OR Python3_FOUND)
+    include("${CMAKE_CURRENT_LIST_DIR}/pybind11NewTools.cmake")
+  else()
+    include("${CMAKE_CURRENT_LIST_DIR}/pybind11NewTools.cmake")
+
+    if(PYBIND11_FINDPYTHON STREQUAL "COMPAT")
+      message(
+        "Using compatibility mode for Python, set PYBIND11_FINDPYTHON to NEW/OLD to silence this message"
+      )
+      set(PYTHON_EXECUTABLE "${Python_EXECUTABLE}")
+      set(PYTHON_INCLUDE_DIR "${Python_INCLUDE_DIR}")
+      set(Python_INCLUDE_DIRS "${Python_INCLUDE_DIRS}")
+      set(PYTHON_LIBRARY "${Python_LIBRARY}")
+      set(PYTHON_LIBRARIES "${Python_LIBRARIES}")
+      set(PYTHON_VERSION "${Python_VERSION}")
+      set(PYTHON_VERSION_STRING "${Python_VERSION_STRING}")
+      set(PYTHON_VERSION_MAJOR "${Python_VERSION_MAJOR}")
+      set(PYTHON_VERSION_MINOR "${Python_VERSION_MINOR}")
+      set(PYTHON_VERSION_PATCH "${Python_VERSION_PATCH}")
+    endif()
+  endif()
 
 else()
 
@@ -209,7 +246,7 @@ endif()
 
 # --------------------- pybind11_find_import -------------------------------
 
-if(NOT _pybind11_nopython)
+if(NOT _pybind11_nopython AND NOT _PYBIND11_CROSSCOMPILING)
   # Check to see if modules are importable. Use REQUIRED to force an error if
   # one of the modules is not found. <package_name>_FOUND will be set if the
   # package was found (underscores replace dashes if present). QUIET will hide
@@ -236,8 +273,15 @@ if(NOT _pybind11_nopython)
 
     execute_process(
       COMMAND
-        ${${_Python}_EXECUTABLE} -c
-        "from pkg_resources import get_distribution; print(get_distribution('${PYPI_NAME}').version)"
+        ${${_Python}_EXECUTABLE} -c "
+try:
+    from importlib.metadata import version
+except ImportError:
+    from pkg_resources import get_distribution
+    def version(s):
+        return get_distribution(s).version
+print(version('${PYPI_NAME}'))
+        "
       RESULT_VARIABLE RESULT_PRESENT
       OUTPUT_VARIABLE PKG_VERSION
       ERROR_QUIET)
@@ -314,20 +358,50 @@ function(_pybind11_generate_lto target prefer_thin_lto)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT APPLE)
       # Clang Gold plugin does not support -Os; append -O3 to MinSizeRel builds to override it
       set(linker_append ";$<$<CONFIG:MinSizeRel>:-O3>")
-    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND NOT MINGW)
+    elseif(
+      CMAKE_CXX_COMPILER_ID MATCHES "GNU"
+      AND NOT MINGW
+      AND NOT APPLE)
+      # GCC on macOS has no linker plugin, which -fno-fat-lto-objects requires
       set(cxx_append ";-fno-fat-lto-objects")
     endif()
 
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND prefer_thin_lto)
-      _pybind11_return_if_cxx_and_linker_flags_work(
-        HAS_FLTO_THIN "-flto=thin${cxx_append}" "-flto=thin${linker_append}"
-        PYBIND11_LTO_CXX_FLAGS PYBIND11_LTO_LINKER_FLAGS)
+    if(prefer_thin_lto)
+      set(thin "=thin")
+    else()
+      set(thin "")
     endif()
 
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le" OR CMAKE_SYSTEM_PROCESSOR MATCHES "mips64")
+      # Do nothing
+    elseif(CMAKE_SYSTEM_NAME MATCHES Emscripten)
+      # This compile is very costly when cross-compiling, so set this without checking
+      set(PYBIND11_LTO_CXX_FLAGS "-flto${thin}${cxx_append}")
+      set(PYBIND11_LTO_LINKER_FLAGS "-flto${thin}${linker_append}")
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+      _pybind11_return_if_cxx_and_linker_flags_work(
+        HAS_FLTO_THIN "-flto${thin}${cxx_append}" "-flto${thin}${linker_append}"
+        PYBIND11_LTO_CXX_FLAGS PYBIND11_LTO_LINKER_FLAGS)
+    endif()
     if(NOT HAS_FLTO_THIN)
+      _pybind11_return_if_cxx_and_linker_flags_work(
+        HAS_FLTO_AUTO "-flto=auto${cxx_append}" "-flto=auto${linker_append}"
+        PYBIND11_LTO_CXX_FLAGS PYBIND11_LTO_LINKER_FLAGS)
+    endif()
+    if(NOT HAS_FLTO_AUTO)
       _pybind11_return_if_cxx_and_linker_flags_work(
         HAS_FLTO "-flto${cxx_append}" "-flto${linker_append}" PYBIND11_LTO_CXX_FLAGS
         PYBIND11_LTO_LINKER_FLAGS)
+    endif()
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
+    # IntelLLVM equivalent to LTO is called IPO; also IntelLLVM is WIN32/UNIX
+    # WARNING/HELP WANTED: This block of code is currently not covered by pybind11 GitHub Actions!
+    if(WIN32)
+      _pybind11_return_if_cxx_and_linker_flags_work(
+        HAS_INTEL_IPO "-Qipo" "-Qipo" PYBIND11_LTO_CXX_FLAGS PYBIND11_LTO_LINKER_FLAGS)
+    else()
+      _pybind11_return_if_cxx_and_linker_flags_work(
+        HAS_INTEL_IPO "-ipo" "-ipo" PYBIND11_LTO_CXX_FLAGS PYBIND11_LTO_LINKER_FLAGS)
     endif()
   elseif(CMAKE_CXX_COMPILER_ID MATCHES "Intel")
     # Intel equivalent to LTO is called IPO
@@ -347,11 +421,7 @@ function(_pybind11_generate_lto target prefer_thin_lto)
     set(is_debug "$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>")
     set(not_debug "$<NOT:${is_debug}>")
     set(cxx_lang "$<COMPILE_LANGUAGE:CXX>")
-    if(MSVC AND CMAKE_VERSION VERSION_LESS 3.11)
-      set(genex "${not_debug}")
-    else()
-      set(genex "$<AND:${not_debug},${cxx_lang}>")
-    endif()
+    set(genex "$<AND:${not_debug},${cxx_lang}>")
     set_property(
       TARGET ${target}
       APPEND
@@ -366,25 +436,20 @@ function(_pybind11_generate_lto target prefer_thin_lto)
   endif()
 
   if(PYBIND11_LTO_LINKER_FLAGS)
-    if(CMAKE_VERSION VERSION_LESS 3.11)
-      set_property(
-        TARGET ${target}
-        APPEND
-        PROPERTY INTERFACE_LINK_LIBRARIES "$<${not_debug}:${PYBIND11_LTO_LINKER_FLAGS}>")
-    else()
-      set_property(
-        TARGET ${target}
-        APPEND
-        PROPERTY INTERFACE_LINK_OPTIONS "$<${not_debug}:${PYBIND11_LTO_LINKER_FLAGS}>")
-    endif()
+    set_property(
+      TARGET ${target}
+      APPEND
+      PROPERTY INTERFACE_LINK_OPTIONS "$<${not_debug}:${PYBIND11_LTO_LINKER_FLAGS}>")
   endif()
 endfunction()
 
-add_library(pybind11::lto IMPORTED INTERFACE ${optional_global})
-_pybind11_generate_lto(pybind11::lto FALSE)
+if(NOT DEFINED CMAKE_INTERPROCEDURAL_OPTIMIZATION)
+  add_library(pybind11::lto IMPORTED INTERFACE ${optional_global})
+  _pybind11_generate_lto(pybind11::lto FALSE)
 
-add_library(pybind11::thin_lto IMPORTED INTERFACE ${optional_global})
-_pybind11_generate_lto(pybind11::thin_lto TRUE)
+  add_library(pybind11::thin_lto IMPORTED INTERFACE ${optional_global})
+  _pybind11_generate_lto(pybind11::thin_lto TRUE)
+endif()
 
 # ---------------------- pybind11_strip -----------------------------
 
@@ -399,5 +464,120 @@ function(pybind11_strip target_name)
       TARGET ${target_name}
       POST_BUILD
       COMMAND ${CMAKE_STRIP} ${x_opt} $<TARGET_FILE:${target_name}>)
+  endif()
+endfunction()
+
+# -fvisibility=hidden is required to allow multiple modules compiled against
+# different pybind versions to work properly, and for some features (e.g.
+# py::module_local).  We force it on everything inside the `pybind11`
+# namespace; also turning it on for a pybind module compilation here avoids
+# potential warnings or issues from having mixed hidden/non-hidden types.
+function(_pybind11_default_hidden_visibility target_name)
+  if(NOT DEFINED CMAKE_CXX_VISIBILITY_PRESET)
+    set_target_properties(${target_name} PROPERTIES CXX_VISIBILITY_PRESET "hidden")
+  endif()
+
+  if(NOT DEFINED CMAKE_CUDA_VISIBILITY_PRESET)
+    set_target_properties(${target_name} PROPERTIES CUDA_VISIBILITY_PRESET "hidden")
+  endif()
+endfunction()
+
+# --------------------- pybind11_precompile -------------------------
+
+# Create the pybind11::precompiled static library (once per build tree). It is
+# built from the consumer's project with the consumer's flags; each extension
+# module links its own copy, preserving pybind11's per-module state. Modules
+# using it must compile with PYBIND11_PRECOMPILED, which the PUBLIC compile
+# definition below provides automatically. With STABLE_ABI the library is
+# compiled against the limited API (Py_LIMITED_API); one build tree cannot mix
+# stable-ABI and regular precompiled modules.
+function(pybind11_precompile)
+  cmake_parse_arguments(ARG "STABLE_ABI" "" "" ${ARGN})
+  if(TARGET pybind11_precompiled)
+    get_target_property(_existing_sabi pybind11_precompiled PYBIND11_STABLE_ABI)
+    if(NOT "${_existing_sabi}" STREQUAL "${ARG_STABLE_ABI}")
+      message(
+        FATAL_ERROR
+          "pybind11::precompiled was created for STABLE_ABI=${_existing_sabi}; one build tree "
+          "cannot mix stable-ABI and regular precompiled modules.")
+    endif()
+    if(ARG_STABLE_ABI)
+      _pybind11_stable_abi_hex(_sabi_hex)
+      _pybind11_stable_abi_is_abi3t(_abi3t)
+      get_target_property(_existing_hex pybind11_precompiled PYBIND11_STABLE_ABI_HEX)
+      get_target_property(_existing_abi3t pybind11_precompiled PYBIND11_ABI3T)
+      if(NOT "${_existing_hex}" STREQUAL "${_sabi_hex}" OR NOT "${_existing_abi3t}" STREQUAL
+                                                           "${_abi3t}")
+        message(
+          FATAL_ERROR
+            "pybind11::precompiled must use the same stable ABI target for every "
+            "module (existing: ${_existing_hex}, abi3t=${_existing_abi3t}; "
+            "requested: ${_sabi_hex}, abi3t=${_abi3t}).")
+      endif()
+    endif()
+    return()
+  endif()
+
+  if(PYBIND11_NOPYTHON)
+    message(FATAL_ERROR "pybind11_precompile requires Python headers; it cannot be used "
+                        "with PYBIND11_NOPYTHON")
+  endif()
+
+  if(NOT pybind11_SRC_DIR OR NOT EXISTS "${pybind11_SRC_DIR}")
+    message(FATAL_ERROR "pybind11 library sources not found (pybind11_SRC_DIR: "
+                        "'${pybind11_SRC_DIR}')")
+  endif()
+
+  # CONFIGURE_DEPENDS: an in-place pybind11 upgrade can add src files; a stale
+  # list would fail with confusing undefined symbols.
+  file(GLOB _pybind11_precompile_sources CONFIGURE_DEPENDS "${pybind11_SRC_DIR}/*.cpp")
+  list(FILTER _pybind11_precompile_sources EXCLUDE REGEX "pybind11_combined\\.cpp$")
+
+  add_library(pybind11_precompiled STATIC EXCLUDE_FROM_ALL ${_pybind11_precompile_sources})
+  add_library(pybind11::precompiled ALIAS pybind11_precompiled)
+  target_compile_definitions(pybind11_precompiled PUBLIC PYBIND11_PRECOMPILED)
+  set_target_properties(pybind11_precompiled PROPERTIES PYBIND11_STABLE_ABI "${ARG_STABLE_ABI}")
+  if(ARG_STABLE_ABI)
+    _pybind11_stable_abi_hex(_sabi_hex)
+    _pybind11_stable_abi_is_abi3t(_abi3t)
+    set_target_properties(pybind11_precompiled PROPERTIES PYBIND11_STABLE_ABI_HEX "${_sabi_hex}"
+                                                          PYBIND11_ABI3T "${_abi3t}")
+    # The same define and Python library as a stable ABI module. pybind11::module would add the
+    # version-specific library to the link line of each module.
+    _pybind11_stable_abi_setup(pybind11_precompiled)
+    target_link_libraries(pybind11_precompiled PUBLIC pybind11::headers)
+  else()
+    # pybind11::module (not just pybind11::pybind11): the library must compile with the
+    # interpreter's ABI macros (e.g. Py_GIL_DISABLED, which FindPython attaches to
+    # Python::Module); on free-threaded Windows they select the correct autolink library.
+    target_link_libraries(
+      pybind11_precompiled
+      PUBLIC pybind11::headers
+      PRIVATE pybind11::module)
+  endif()
+  set_target_properties(pybind11_precompiled PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  _pybind11_default_hidden_visibility(pybind11_precompiled)
+  if(NOT DEFINED CMAKE_VISIBILITY_INLINES_HIDDEN)
+    set_target_properties(pybind11_precompiled PROPERTIES VISIBILITY_INLINES_HIDDEN ON)
+  endif()
+  if(MSVC)
+    target_link_libraries(pybind11_precompiled PRIVATE pybind11::windows_extras)
+  endif()
+
+  # The first caller creates the library, so its directory scope supplies the
+  # library's flags and C++ standard; record it to make that visible.
+  message(STATUS "pybind11::precompiled created in ${CMAKE_CURRENT_SOURCE_DIR}")
+endfunction()
+
+# Link pybind11::precompiled when the PRECOMPILE keyword or the global
+# PYBIND11_PRECOMPILE variable requests it, unless NO_PRECOMPILE opts out.
+function(_pybind11_maybe_precompile target_name precompile no_precompile stable_abi)
+  if((precompile OR PYBIND11_PRECOMPILE) AND NOT no_precompile)
+    set(_kw "")
+    if(stable_abi)
+      set(_kw STABLE_ABI)
+    endif()
+    pybind11_precompile(${_kw})
+    target_link_libraries(${target_name} PRIVATE pybind11::precompiled)
   endif()
 endfunction()

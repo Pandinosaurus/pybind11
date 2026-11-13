@@ -9,21 +9,38 @@
 
 #pragma once
 
+// common.h must come first: on PyPy/GraalPy it defines PYBIND11_SIMPLE_GIL_MANAGEMENT,
+// which selects the branch below.
 #include "detail/common.h"
-#include "detail/internals.h"
+
+#if defined(PYBIND11_SIMPLE_GIL_MANAGEMENT)
+
+#    include "gil_simple.h"
 
 PYBIND11_NAMESPACE_BEGIN(PYBIND11_NAMESPACE)
 
+using gil_scoped_acquire = gil_scoped_acquire_simple;
+using gil_scoped_release = gil_scoped_release_simple;
+
+PYBIND11_NAMESPACE_END(PYBIND11_NAMESPACE)
+
+#else
+
+#    include "detail/internals.h"
+
+PYBIND11_NAMESPACE_BEGIN(PYBIND11_NAMESPACE)
 
 PYBIND11_NAMESPACE_BEGIN(detail)
+
+PYBIND11_WARNING_PUSH
+PYBIND11_WARNING_DISABLE_GCC("-Wredundant-decls")
 
 // forward declarations
 PyThreadState *get_thread_state_unchecked();
 
+PYBIND11_WARNING_POP
+
 PYBIND11_NAMESPACE_END(detail)
-
-
-#if defined(WITH_THREAD) && !defined(PYPY_VERSION)
 
 /* The functions below essentially reproduce the PyGILState_* API using a RAII
  * pattern, but there are a few important differences:
@@ -49,77 +66,24 @@ PYBIND11_NAMESPACE_END(detail)
 
 class gil_scoped_acquire {
 public:
-    PYBIND11_NOINLINE gil_scoped_acquire() {
-        auto &internals = detail::get_internals();
-        tstate = (PyThreadState *) PYBIND11_TLS_GET_VALUE(internals.tstate);
+    gil_scoped_acquire();
 
-        if (!tstate) {
-            /* Check if the GIL was acquired using the PyGILState_* API instead (e.g. if
-               calling from a Python thread). Since we use a different key, this ensures
-               we don't create a new thread state and deadlock in PyEval_AcquireThread
-               below. Note we don't save this state with internals.tstate, since we don't
-               create it we would fail to clear it (its reference count should be > 0). */
-            tstate = PyGILState_GetThisThreadState();
-        }
+    gil_scoped_acquire(const gil_scoped_acquire &) = delete;
+    gil_scoped_acquire &operator=(const gil_scoped_acquire &) = delete;
 
-        if (!tstate) {
-            tstate = PyThreadState_New(internals.istate);
-            #if !defined(NDEBUG)
-                if (!tstate)
-                    pybind11_fail("scoped_acquire: could not create thread state!");
-            #endif
-            tstate->gilstate_counter = 0;
-            PYBIND11_TLS_REPLACE_VALUE(internals.tstate, tstate);
-        } else {
-            release = detail::get_thread_state_unchecked() != tstate;
-        }
+    void inc_ref() { ++tstate->gilstate_counter; }
 
-        if (release) {
-            PyEval_AcquireThread(tstate);
-        }
-
-        inc_ref();
-    }
-
-    void inc_ref() {
-        ++tstate->gilstate_counter;
-    }
-
-    PYBIND11_NOINLINE void dec_ref() {
-        --tstate->gilstate_counter;
-        #if !defined(NDEBUG)
-            if (detail::get_thread_state_unchecked() != tstate)
-                pybind11_fail("scoped_acquire::dec_ref(): thread state must be current!");
-            if (tstate->gilstate_counter < 0)
-                pybind11_fail("scoped_acquire::dec_ref(): reference count underflow!");
-        #endif
-        if (tstate->gilstate_counter == 0) {
-            #if !defined(NDEBUG)
-                if (!release)
-                    pybind11_fail("scoped_acquire::dec_ref(): internal error!");
-            #endif
-            PyThreadState_Clear(tstate);
-            if (active)
-                PyThreadState_DeleteCurrent();
-            PYBIND11_TLS_DELETE_VALUE(detail::get_internals().tstate);
-            release = false;
-        }
-    }
+    void dec_ref();
 
     /// This method will disable the PyThreadState_DeleteCurrent call and the
-    /// GIL won't be acquired. This method should be used if the interpreter
+    /// GIL won't be released. This method should be used if the interpreter
     /// could be shutting down when this is called, as thread deletion is not
     /// allowed during shutdown. Check _Py_IsFinalizing() on Python 3.7+, and
     /// protect subsequent code.
-    PYBIND11_NOINLINE void disarm() {
-        active = false;
-    }
+    PYBIND11_NOINLINE void disarm() { active = false; }
 
-    PYBIND11_NOINLINE ~gil_scoped_acquire() {
-        dec_ref();
-        if (release)
-           PyEval_SaveThread();
-    }
+    ~gil_scoped_acquire();
+
 private:
     PyThreadState *tstate = nullptr;
     bool release = true;
@@ -128,66 +92,31 @@ private:
 
 class gil_scoped_release {
 public:
-    explicit gil_scoped_release(bool disassoc = false) : disassoc(disassoc) {
-        // `get_internals()` must be called here unconditionally in order to initialize
-        // `internals.tstate` for subsequent `gil_scoped_acquire` calls. Otherwise, an
-        // initialization race could occur as multiple threads try `gil_scoped_acquire`.
-        auto &internals = detail::get_internals();
-        tstate = PyEval_SaveThread();
-        if (disassoc) {
-            auto key = internals.tstate;
-            PYBIND11_TLS_DELETE_VALUE(key);
-        }
-    }
+    // PRECONDITION: The GIL must be held when this constructor is called.
+    explicit gil_scoped_release(bool disassoc = false);
+
+    gil_scoped_release(const gil_scoped_release &) = delete;
+    gil_scoped_release &operator=(const gil_scoped_release &) = delete;
 
     /// This method will disable the PyThreadState_DeleteCurrent call and the
     /// GIL won't be acquired. This method should be used if the interpreter
     /// could be shutting down when this is called, as thread deletion is not
     /// allowed during shutdown. Check _Py_IsFinalizing() on Python 3.7+, and
     /// protect subsequent code.
-    PYBIND11_NOINLINE void disarm() {
-        active = false;
-    }
+    PYBIND11_NOINLINE void disarm() { active = false; }
 
-    ~gil_scoped_release() {
-        if (!tstate)
-            return;
-        // `PyEval_RestoreThread()` should not be called if runtime is finalizing
-        if (active)
-            PyEval_RestoreThread(tstate);
-        if (disassoc) {
-            auto key = detail::get_internals().tstate;
-            PYBIND11_TLS_REPLACE_VALUE(key, tstate);
-        }
-    }
+    ~gil_scoped_release();
+
 private:
     PyThreadState *tstate;
     bool disassoc;
     bool active = true;
 };
-#elif defined(PYPY_VERSION)
-class gil_scoped_acquire {
-    PyGILState_STATE state;
-public:
-    gil_scoped_acquire() { state = PyGILState_Ensure(); }
-    ~gil_scoped_acquire() { PyGILState_Release(state); }
-    void disarm() {}
-};
-
-class gil_scoped_release {
-    PyThreadState *state;
-public:
-    gil_scoped_release() { state = PyEval_SaveThread(); }
-    ~gil_scoped_release() { PyEval_RestoreThread(state); }
-    void disarm() {}
-};
-#else
-class gil_scoped_acquire {
-    void disarm() {}
-};
-class gil_scoped_release {
-    void disarm() {}
-};
-#endif
 
 PYBIND11_NAMESPACE_END(PYBIND11_NAMESPACE)
+
+#    ifndef PYBIND11_PRECOMPILED
+#        include "gil-inl.h" // IWYU pragma: export
+#    endif
+
+#endif // !PYBIND11_SIMPLE_GIL_MANAGEMENT

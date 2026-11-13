@@ -1,10 +1,17 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import importlib
+import os
+import re
 import sys
+import threading
 
 import pytest
+from custom_exceptions import PythonMyException7
 
-import env  # noqa: F401
+import env
 import pybind11_cross_module_tests as cm
+import pybind11_tests
 from pybind11_tests import exceptions as m
 
 
@@ -17,14 +24,16 @@ def test_std_exception(msg):
 def test_error_already_set(msg):
     with pytest.raises(RuntimeError) as excinfo:
         m.throw_already_set(False)
-    assert msg(excinfo.value) == "Unknown internal error occurred"
+    assert (
+        msg(excinfo.value)
+        == "Internal error: pybind11::error_already_set called while Python error indicator not set."
+    )
 
     with pytest.raises(ValueError) as excinfo:
         m.throw_already_set(True)
     assert msg(excinfo.value) == "foo"
 
 
-@pytest.mark.skipif("env.PY2")
 def test_raise_from(msg):
     with pytest.raises(ValueError) as excinfo:
         m.raise_from()
@@ -32,7 +41,6 @@ def test_raise_from(msg):
     assert msg(excinfo.value.__cause__) == "inner"
 
 
-@pytest.mark.skipif("env.PY2")
 def test_raise_from_already_set(msg):
     with pytest.raises(ValueError) as excinfo:
         m.raise_from_already_set()
@@ -70,16 +78,38 @@ def test_cross_module_exceptions(msg):
     assert str(excinfo.value) == "'just local'"
 
 
-# TODO: FIXME
 @pytest.mark.xfail(
-    "env.PYPY and env.MACOS",
+    "(env.MACOS and env.PYPY_PRE_7_3_23) or env.ANDROID or env.FREEBSD",
     raises=RuntimeError,
-    reason="Expected failure with PyPy and libc++ (Issue #2847 & PR #2999)",
+    reason="See Issue #2847, PR #2999, PR #4324, PR #5925",
 )
 def test_cross_module_exception_translator():
     with pytest.raises(KeyError):
         # translator registered in cross_module_tests
         m.throw_should_be_translated_to_key_error()
+
+
+@pytest.mark.xfail(
+    env.FREEBSD,
+    raises=RuntimeError,
+    reason="Cross-module exception RTTI mismatch on FreeBSD; see PR #5925",
+)
+def test_cross_module_exception_translator_after_later_import():
+    # A module imported later must not shadow translators registered earlier
+    env.check_script_success_in_subprocess(
+        f"""
+        import sys
+        sys.path.insert(0, {os.path.dirname(env.__file__)!r})
+        from pybind11_tests import exceptions as m
+        import pybind11_cross_module_tests
+        import mod_concurrent_import
+        try:
+            m.throw_should_be_translated_to_key_error()
+        except KeyError:
+            pass
+        """,
+        rerun=1,
+    )
 
 
 def test_python_call_in_catch():
@@ -90,40 +120,42 @@ def test_python_call_in_catch():
 
 def ignore_pytest_unraisable_warning(f):
     unraisable = "PytestUnraisableExceptionWarning"
-    if hasattr(pytest, unraisable):  # Python >= 3.8 and pytest >= 6
-        dec = pytest.mark.filterwarnings("ignore::pytest.{}".format(unraisable))
+    if hasattr(pytest, unraisable):  # pytest >= 6
+        dec = pytest.mark.filterwarnings(f"ignore::pytest.{unraisable}")
         return dec(f)
-    else:
-        return f
+    return f
 
 
+# TODO: find out why this fails on PyPy, https://foss.heptapod.net/pypy/pypy/-/issues/3583
+@pytest.mark.xfail(
+    env.PYPY, reason="Failure on PyPy (still fails with 7.3.23)", strict=False
+)
 @ignore_pytest_unraisable_warning
 def test_python_alreadyset_in_destructor(monkeypatch, capsys):
-    hooked = False
-    triggered = [False]  # mutable, so Python 2.7 closure can modify it
+    triggered = False
 
-    if hasattr(sys, "unraisablehook"):  # Python 3.8+
-        hooked = True
-        # Don't take `sys.unraisablehook`, as that's overwritten by pytest
-        default_hook = sys.__unraisablehook__
+    # Don't take `sys.unraisablehook`, as that's overwritten by pytest
+    default_hook = sys.__unraisablehook__
 
-        def hook(unraisable_hook_args):
-            exc_type, exc_value, exc_tb, err_msg, obj = unraisable_hook_args
-            if obj == "already_set demo":
-                triggered[0] = True
-            default_hook(unraisable_hook_args)
-            return
+    def hook(unraisable_hook_args):
+        _exc_type, _exc_value, _exc_tb, _err_msg, obj = unraisable_hook_args
+        if obj == "already_set demo":
+            nonlocal triggered
+            triggered = True
+        default_hook(unraisable_hook_args)
+        return
 
-        # Use monkeypatch so pytest can apply and remove the patch as appropriate
-        monkeypatch.setattr(sys, "unraisablehook", hook)
+    # Use monkeypatch so pytest can apply and remove the patch as appropriate
+    monkeypatch.setattr(sys, "unraisablehook", hook)
 
     assert m.python_alreadyset_in_destructor("already_set demo") is True
-    if hooked:
-        assert triggered[0] is True
+    assert triggered is True
 
     _, captured_stderr = capsys.readouterr()
-    # Error message is different in Python 2 and 3, check for words that appear in both
-    assert "ignored" in captured_stderr and "already_set demo" in captured_stderr
+    # Strip ANSI codes that Python 3.15+ adds to this traceback under FORCE_COLOR.
+    captured_stderr = re.sub(r"\x1b\[[0-?]*[ -/]*m", "", captured_stderr)
+    assert captured_stderr.startswith("Exception ignored in: 'already_set demo'")
+    assert captured_stderr.rstrip().endswith("KeyError: 'bar'")
 
 
 def test_exception_matches():
@@ -136,7 +168,15 @@ def test_custom(msg):
     # Can we catch a MyException?
     with pytest.raises(m.MyException) as excinfo:
         m.throws1()
-    assert msg(excinfo.value) == "this error should go to a custom type"
+    assert msg(excinfo.value) == "this error should go to py::exception<MyException>"
+
+    # Can we catch a MyExceptionUseDeprecatedOperatorCall?
+    with pytest.raises(m.MyExceptionUseDeprecatedOperatorCall) as excinfo:
+        m.throws1d()
+    assert (
+        msg(excinfo.value)
+        == "this error should go to py::exception<MyExceptionUseDeprecatedOperatorCall>"
+    )
 
     # Can we translate to standard Python exceptions?
     with pytest.raises(RuntimeError) as excinfo:
@@ -179,14 +219,19 @@ def test_custom(msg):
         m.throws5_1()
     assert msg(excinfo.value) == "MyException5 subclass"
 
-    with pytest.raises(m.MyException5) as excinfo:
+    with pytest.raises(m.MyException5) as excinfo:  # noqa: PT012
         try:
             m.throws5()
-        except m.MyException5_1:
-            raise RuntimeError("Exception error: caught child from parent")
+        except m.MyException5_1 as err:
+            raise RuntimeError("Exception error: caught child from parent") from err
     assert msg(excinfo.value) == "this is a helper-defined translated exception"
 
+    with pytest.raises(PythonMyException7) as excinfo:
+        m.throws7()
+    assert msg(excinfo.value) == "[PythonMyException7]: abc"
 
+
+@pytest.mark.xfail("env.GRAALPY and sys.version_info < (3, 13)")
 def test_nested_throws(capture):
     """Tests nested (e.g. C++ -> Python -> C++) exception handling"""
 
@@ -208,7 +253,7 @@ def test_nested_throws(capture):
         m.try_catch(m.MyException5, throw_myex)
     assert str(excinfo.value) == "nested error"
 
-    def pycatch(exctype, f, *args):
+    def pycatch(exctype, f, *args):  # noqa: ARG001
         try:
             f(*args)
         except m.MyException as e:
@@ -237,9 +282,21 @@ def test_nested_throws(capture):
     assert str(excinfo.value) == "this is a helper-defined translated exception"
 
 
+# TODO: Investigate this crash, see pybind/pybind11#5062 for background
+@pytest.mark.skipif(
+    sys.platform.startswith("win32") and "Clang" in pybind11_tests.compiler_info,
+    reason="Started segfaulting February 2024",
+)
+def test_throw_nested_exception():
+    with pytest.raises(RuntimeError) as excinfo:
+        m.throw_nested_exception()
+    assert str(excinfo.value) == "Outer Exception"
+    assert str(excinfo.value.__cause__) == "Inner Exception"
+
+
 # This can often happen if you wrap a pybind11 class in a Python wrapper
 def test_invalid_repr():
-    class MyRepr(object):
+    class MyRepr:
         def __repr__(self):
             raise AttributeError("Example error")
 
@@ -263,3 +320,253 @@ def test_local_translator(msg):
         m.throws_local_simple_error()
     assert not isinstance(excinfo.value, cm.LocalSimpleException)
     assert msg(excinfo.value) == "this mod"
+
+
+def test_error_already_set_message_with_unicode_surrogate():  # Issue #4288
+    assert m.error_already_set_what(RuntimeError, "\ud927") == (
+        "RuntimeError: \\ud927",
+        False,
+    )
+
+
+def test_error_already_set_message_with_malformed_utf8():
+    assert m.error_already_set_what(RuntimeError, b"\x80") == (
+        "RuntimeError: b'\\x80'",
+        False,
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(m, "error_already_set_without_tp_name"),
+    reason="Requires write access to tp_name",
+)
+def test_error_already_set_without_tp_name():
+    assert m.error_already_set_without_tp_name() == (
+        "<EXCEPTION TYPE NAME UNAVAILABLE>: primary message"
+    )
+
+
+class FlakyException(Exception):
+    def __init__(self, failure_point):
+        if failure_point == "failure_point_init":
+            raise ValueError("triggered_failure_point_init")
+        self.failure_point = failure_point
+
+    def __str__(self):
+        if self.failure_point == "failure_point_str":
+            raise ValueError("triggered_failure_point_str")
+        return "FlakyException.__str__"
+
+
+@pytest.mark.parametrize(
+    ("exc_type", "exc_value", "expected_what"),
+    [
+        (ValueError, "plain_str", "ValueError: plain_str"),
+        (ValueError, ("tuple_elem",), "ValueError: tuple_elem"),
+        (FlakyException, ("happy",), "FlakyException: FlakyException.__str__"),
+        (
+            type("", (Exception,), {}),
+            "primary message",
+            "<EXCEPTION TYPE NAME UNAVAILABLE>: primary message",
+        ),
+    ],
+)
+def test_error_already_set_what_with_happy_exceptions(
+    exc_type, exc_value, expected_what
+):
+    what, py_err_set_after_what = m.error_already_set_what(exc_type, exc_value)
+    assert not py_err_set_after_what
+    assert what == expected_what
+
+
+def test_error_already_set_unnamed_exception_roundtrip():
+    unnamed_error = type("", (Exception,), {})
+    try:
+        raise unnamed_error("primary message")
+    except Exception as exc:
+        original = exc
+    original_trace = original.__traceback__
+    what, error_set, matches, exc_type, value, trace = m.error_already_set_roundtrip(
+        original, original_trace
+    )
+    assert what.startswith("<EXCEPTION TYPE NAME UNAVAILABLE>: primary message")
+    if not env.PYPY and not env.GRAALPY:
+        assert "): test_error_already_set_unnamed_exception_roundtrip" in what
+    assert not error_set
+    assert matches
+    assert exc_type is unnamed_error
+    assert value is original
+    assert trace is original_trace
+
+
+def test_error_already_set_unnamed_secondary_exception():
+    unnamed_error = type("", (Exception,), {})
+
+    class BadStrError(Exception):
+        def __str__(self):
+            raise unnamed_error("secondary message")
+
+    what, error_set = m.error_already_set_what(BadStrError, "primary message")
+    assert what.startswith(
+        "BadStrError: <MESSAGE UNAVAILABLE DUE TO ANOTHER EXCEPTION>"
+    )
+    assert (
+        "MESSAGE UNAVAILABLE DUE TO EXCEPTION: "
+        "<EXCEPTION TYPE NAME UNAVAILABLE>: secondary message"
+    ) in what
+    assert not error_set
+
+
+def _test_flaky_exception_failure_point_init_before_py_3_12():
+    with pytest.raises(RuntimeError) as excinfo:
+        m.error_already_set_what(FlakyException, ("failure_point_init",))
+    lines = str(excinfo.value).splitlines()
+    # PyErr_NormalizeException replaces the original FlakyException with ValueError:
+    assert lines[:3] == [
+        (
+            "pybind11::error_already_set: MISMATCH of original and normalized active exception types:"
+            " ORIGINAL FlakyException REPLACED BY ValueError: triggered_failure_point_init"
+        ),
+        "",
+        "At:",
+    ]
+    # Checking the first two lines of the traceback as formatted in error_string():
+    assert "test_exceptions.py(" in lines[3]
+    assert lines[3].endswith("): __init__")
+    assert lines[4].endswith(
+        "): _test_flaky_exception_failure_point_init_before_py_3_12"
+    )
+
+
+def _test_flaky_exception_failure_point_init_py_3_12():
+    # Behavior change in Python 3.12: https://github.com/python/cpython/issues/102594
+    what, py_err_set_after_what = m.error_already_set_what(
+        FlakyException, ("failure_point_init",)
+    )
+    assert not py_err_set_after_what
+    lines = what.splitlines()
+    assert lines[0].endswith("ValueError[WITH __notes__]: triggered_failure_point_init")
+    assert lines[1] == "__notes__ (len=1):"
+    assert "Normalization failed:" in lines[2]
+    assert "FlakyException" in lines[2]
+
+
+@pytest.mark.skipif(
+    "env.PYPY and sys.version_info[:2] < (3, 12)",
+    reason="PyErr_NormalizeException Segmentation fault",
+)
+@pytest.mark.xfail("env.GRAALPY", reason="TODO should be fixed on GraalPy side")
+def test_flaky_exception_failure_point_init():
+    if sys.version_info[:2] < (3, 12):
+        _test_flaky_exception_failure_point_init_before_py_3_12()
+    else:
+        _test_flaky_exception_failure_point_init_py_3_12()
+
+
+@pytest.mark.xfail("env.GRAALPY", reason="TODO should be fixed on GraalPy side")
+def test_flaky_exception_failure_point_str():
+    what, py_err_set_after_what = m.error_already_set_what(
+        FlakyException, ("failure_point_str",)
+    )
+    assert not py_err_set_after_what
+    lines = what.splitlines()
+    n = 3 if env.PYPY and len(lines) == 3 else 5
+    assert (
+        lines[:n]
+        == [
+            "FlakyException: <MESSAGE UNAVAILABLE DUE TO ANOTHER EXCEPTION>",
+            "",
+            "MESSAGE UNAVAILABLE DUE TO EXCEPTION: ValueError: triggered_failure_point_str",
+            "",
+            "At:",
+        ][:n]
+    )
+
+
+@pytest.mark.skipif("env.PYPY or env.GRAALPY", reason="No traceback in what()")
+def test_error_already_set_what_traceback(capture):
+    def inner():
+        raise ValueError("deep")
+
+    def outer():
+        inner()
+
+    with capture:
+        m.try_catch(ValueError, outer)
+    lines = str(capture).splitlines()
+    assert lines[:3] == ["ValueError: deep", "", "At:"]
+    assert lines[3].endswith(
+        f"test_exceptions.py({inner.__code__.co_firstlineno + 1}): inner"
+    )
+    assert lines[4].endswith(
+        f"test_exceptions.py({outer.__code__.co_firstlineno + 1}): outer"
+    )
+    assert lines[5].endswith("): test_error_already_set_what_traceback")
+
+
+def test_cross_module_interleaved_error_already_set():
+    with pytest.raises(RuntimeError) as excinfo:
+        m.test_cross_module_interleaved_error_already_set()
+    assert str(excinfo.value) in (
+        "2nd error.",  # Almost all platforms.
+        "RuntimeError: 2nd error.",  # Some PyPy builds (seen under macOS).
+    )
+
+
+def test_error_already_set_double_restore():
+    m.test_error_already_set_double_restore(True)  # dry_run
+    with pytest.raises(RuntimeError) as excinfo:
+        m.test_error_already_set_double_restore(False)
+    assert str(excinfo.value) == (
+        "Internal error: pybind11::detail::error_fetch_and_normalize::restore()"
+        " called a second time. ORIGINAL ERROR: ValueError: Random error."
+    )
+
+
+def test_pypy_oserror_normalization():
+    # https://github.com/pybind/pybind11/issues/4075
+    what = m.test_pypy_oserror_normalization()
+    assert "this_filename_must_not_exist" in what
+
+
+def test_fn_cast_int_exception():
+    with pytest.raises(RuntimeError) as excinfo:
+        m.test_fn_cast_int(lambda: None)
+
+    assert str(excinfo.value).startswith(
+        "Unable to cast Python instance of type <class 'NoneType'> to C++ type"
+    )
+
+
+def test_return_exception_void():
+    with pytest.raises(TypeError) as excinfo:
+        m.return_exception_void()
+    assert "Exception" in str(excinfo.value)
+
+
+@pytest.mark.skipif("not env.PY_GIL_DISABLED", reason="Only relevant without the GIL")
+def test_local_translator_registration_vs_internals_fetch():
+    # Nothing to assert: the race only shows up under TSan, and only with libc++ or
+    # MSVC (the hook isn't built with libstdc++).
+    if "mod_concurrent_import" in sys.modules:
+        pytest.skip("The first import can only be exercised once per process")
+
+    stop = threading.Event()
+    errors = []
+
+    def ensure_internals_loop():
+        try:
+            while not stop.is_set():
+                m.ensure_internals()
+        except Exception as e:
+            errors.append(e)
+
+    reader = threading.Thread(target=ensure_internals_loop)
+    reader.start()
+    try:
+        importlib.import_module("mod_concurrent_import")
+    finally:
+        stop.set()
+        reader.join()
+    if errors:
+        raise errors[0]

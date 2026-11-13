@@ -16,7 +16,7 @@ lifetime of objects managed by them. This can lead to issues when creating
 bindings for functions that return a non-trivial type. Just by looking at the
 type information, it is not clear whether Python should take charge of the
 returned value and eventually free its resources, or if this is handled on the
-C++ side. For this reason, pybind11 provides a several *return value policy*
+C++ side. For this reason, pybind11 provides several *return value policy*
 annotations that can be passed to the :func:`module_::def` and
 :func:`class_::def` functions. The default policy is
 :enum:`return_value_policy::automatic`.
@@ -81,9 +81,11 @@ The following table provides an overview of available policies:
 |                                                  | it is no longer used. Warning: undefined behavior will ensue when the C++  |
 |                                                  | side deletes an object that is still referenced and used by Python.        |
 +--------------------------------------------------+----------------------------------------------------------------------------+
-| :enum:`return_value_policy::reference_internal`  | Indicates that the lifetime of the return value is tied to the lifetime    |
-|                                                  | of a parent object, namely the implicit ``this``, or ``self`` argument of  |
-|                                                  | the called method or property. Internally, this policy works just like     |
+| :enum:`return_value_policy::reference_internal`  | If the return value is an lvalue reference or a pointer, the parent object |
+|                                                  | (the implicit ``this``, or ``self`` argument of the called method or       |
+|                                                  | property) is kept alive for at least the lifespan of the return value.     |
+|                                                  | **Otherwise this policy falls back to** :enum:`return_value_policy::move`  |
+|                                                  | (see #5528). Internally, this policy works just like                       |
 |                                                  | :enum:`return_value_policy::reference` but additionally applies a          |
 |                                                  | ``keep_alive<0, 1>`` *call policy* (described in the next section) that    |
 |                                                  | prevents the parent object from being garbage collected as long as the     |
@@ -120,7 +122,7 @@ targeted arguments can be passed through the :class:`cpp_function` constructor:
 .. code-block:: cpp
 
     class_<MyClass>(m, "MyClass")
-        .def_property("data"
+        .def_property("data",
             py::cpp_function(&MyClass::getData, py::return_value_policy::copy),
             py::cpp_function(&MyClass::setData)
         );
@@ -230,6 +232,12 @@ is equivalent to the following pseudocode:
         T scope_guard;
         return foo(args...); // forwarded arguments
     });
+
+Argument conversion, including extraction from type casters, finishes before
+the guards are constructed. A candidate rejected during argument conversion
+does not construct its guards. Call-policy ``precall`` hooks also run before
+guard construction, and the guards are destroyed before Python return-value
+conversion.
 
 The only requirement is that ``T`` is default-constructible, but otherwise any
 scope guard will work. This is very useful in combination with ``gil_scoped_release``.
@@ -372,7 +380,7 @@ like so:
 Keyword-only arguments
 ======================
 
-Python 3 introduced keyword-only arguments by specifying an unnamed ``*``
+Python implements keyword-only arguments by specifying an unnamed ``*``
 argument in a function definition:
 
 .. code-block:: python
@@ -395,19 +403,18 @@ argument annotations when registering the function:
     m.def("f", [](int a, int b) { /* ... */ },
           py::arg("a"), py::kw_only(), py::arg("b"));
 
-Note that you currently cannot combine this with a ``py::args`` argument.  This
-feature does *not* require Python 3 to work.
-
 .. versionadded:: 2.6
 
-As of pybind11 2.9, a ``py::args`` argument implies that any following arguments
-are keyword-only, as if ``py::kw_only()`` had been specified in the same
-relative location of the argument list as the ``py::args`` argument.  The
-``py::kw_only()`` may be included to be explicit about this, but is not
-required.  (Prior to 2.9 ``py::args`` may only occur at the end of the argument
-list, or immediately before a ``py::kwargs`` argument at the end).
+A ``py::args`` argument implies that any following arguments are keyword-only,
+as if ``py::kw_only()`` had been specified in the same relative location of the
+argument list as the ``py::args`` argument.  The ``py::kw_only()`` may be
+included to be explicit about this, but is not required.
 
-.. versionadded:: 2.9
+.. versionchanged:: 2.9
+   This can now be combined with ``py::args``. Before, ``py::args`` could only
+   occur at the end of the argument list, or immediately before a ``py::kwargs``
+   argument at the end.
+
 
 Positional-only arguments
 =========================
@@ -436,10 +443,10 @@ Certain argument types may support conversion from one type to another.  Some
 examples of conversions are:
 
 * :ref:`implicit_conversions` declared using ``py::implicitly_convertible<A,B>()``
-* Calling a method accepting a double with an integer argument
-* Calling a ``std::complex<float>`` argument with a non-complex python type
-  (for example, with a float).  (Requires the optional ``pybind11/complex.h``
-  header).
+* Passing an argument that implements ``__float__`` or ``__index__`` to ``float`` or ``double``.
+* Passing an argument that implements ``__int__`` or ``__index__`` to ``int``.
+* Passing an argument that implements ``__complex__``, ``__float__``, or ``__index__`` to ``std::complex<float>``.
+  (Requires the optional ``pybind11/complex.h`` header).
 * Calling a function taking an Eigen matrix reference with a numpy array of the
   wrong type or of an incompatible data layout.  (Requires the optional
   ``pybind11/eigen.h`` header).
@@ -451,24 +458,37 @@ object, such as:
 
 .. code-block:: cpp
 
-    m.def("floats_only", [](double f) { return 0.5 * f; }, py::arg("f").noconvert());
-    m.def("floats_preferred", [](double f) { return 0.5 * f; }, py::arg("f"));
+    m.def("supports_float", [](double f) { return 0.5 * f; }, py::arg("f"));
+    m.def("only_float", [](double f) { return 0.5 * f; }, py::arg("f").noconvert());
 
-Attempting the call the second function (the one without ``.noconvert()``) with
-an integer will succeed, but attempting to call the ``.noconvert()`` version
-will fail with a ``TypeError``:
+``supports_float`` will accept any argument that implements ``__float__`` or ``__index__``.
+``only_float`` will only accept a float or int argument. Anything else will fail with a ``TypeError``:
+
+.. note::
+
+    The noconvert behaviour of float, double and complex has changed to match PEP 484.
+    A float/double argument marked noconvert will accept float or int.
+    A std::complex<float> argument will accept complex, float or int.
 
 .. code-block:: pycon
 
-    >>> floats_preferred(4)
+    class MyFloat:
+        def __init__(self, value: float) -> None:
+            self._value = float(value)
+        def __repr__(self) -> str:
+            return f"MyFloat({self._value})"
+        def __float__(self) -> float:
+            return self._value
+
+    >>> supports_float(MyFloat(4))
     2.0
-    >>> floats_only(4)
+    >>> only_float(MyFloat(4))
     Traceback (most recent call last):
       File "<stdin>", line 1, in <module>
-    TypeError: floats_only(): incompatible function arguments. The following argument types are supported:
+    TypeError: only_float(): incompatible function arguments. The following argument types are supported:
         1. (f: float) -> float
 
-    Invoked with: 4
+    Invoked with: MyFloat(4)
 
 You may, of course, combine this with the :var:`_a` shorthand notation (see
 :ref:`keyword_args`) and/or :ref:`default_args`.  It is also permitted to omit
@@ -578,3 +598,38 @@ prefers earlier-defined overloads to later-defined ones.
 .. versionadded:: 2.6
 
     The ``py::prepend()`` tag.
+
+Binding functions with template parameters
+==========================================
+
+You can bind functions that have template parameters. Here's a function:
+
+.. code-block:: cpp
+
+    template <typename T>
+    void set(T t);
+
+C++ templates cannot be instantiated at runtime, so you cannot bind the
+non-instantiated function:
+
+.. code-block:: cpp
+
+    // BROKEN (this will not compile)
+    m.def("set", &set);
+
+You must bind each instantiated function template separately. You may bind
+each instantiation with the same name, which will be treated the same as
+an overloaded function:
+
+.. code-block:: cpp
+
+    m.def("set", &set<int>);
+    m.def("set", &set<std::string>);
+
+Sometimes it's more clear to bind them with separate names, which is also
+an option:
+
+.. code-block:: cpp
+
+    m.def("setInt", &set<int>);
+    m.def("setString", &set<std::string>);

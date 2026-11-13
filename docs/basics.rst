@@ -11,6 +11,12 @@ included set of test cases.
 Compiling the test cases
 ========================
 
+The commands below are meant to be run from the root of a source checkout
+of the pybind11 repository. They compile and run the test suite bundled in
+the :file:`tests` directory, which is included in the repository but not in
+the pybind11 wheels on PyPI. If you installed pybind11 with ``pip``, start
+from a git checkout of the repository instead (see :ref:`installing`).
+
 Linux/macOS
 -----------
 
@@ -32,16 +38,14 @@ The last line will both compile and run the tests.
 Windows
 -------
 
-On Windows, only **Visual Studio 2015** and newer are supported since pybind11 relies
-on various C++11 language features that break older versions of Visual Studio.
+On Windows, only **Visual Studio 2019** and newer are supported.
 
 .. Note::
 
-    To use the C++17 in Visual Studio 2017 (MSVC 14.1), pybind11 requires the flag
-    ``/permissive-`` to be passed to the compiler `to enforce standard conformance`_. When
-    building with Visual Studio 2019, this is not strictly necessary, but still advised.
+    The ``/permissive-`` flag `to enforce standard conformance`_ is not necessary, but it is
+    still advised.
 
-..  _`to enforce standard conformance`: https://docs.microsoft.com/en-us/cpp/build/reference/permissive-standards-conformance?view=vs-2017
+..  _`to enforce standard conformance`: https://docs.microsoft.com/en-us/cpp/build/reference/permissive-standards-conformance
 
 To compile and run the tests:
 
@@ -79,6 +83,13 @@ For brevity, all code examples assume that the following two lines are present:
 
     namespace py = pybind11;
 
+.. note::
+
+    ``pybind11/pybind11.h`` includes ``Python.h``, as such it must be the first file
+    included in any source file or header for `the same reasons as Python.h`_.
+
+.. _`the same reasons as Python.h`: https://docs.python.org/3/extending/extending.html#a-simple-example
+
 Some features may require additional headers, but those will be specified as needed.
 
 .. _simple_example:
@@ -102,14 +113,16 @@ a file named :file:`example.cpp` with the following contents:
 
     #include <pybind11/pybind11.h>
 
+    namespace py = pybind11;
+
     int add(int i, int j) {
         return i + j;
     }
 
-    PYBIND11_MODULE(example, m) {
+    PYBIND11_MODULE(example, m, py::mod_gil_not_used()) {
         m.doc() = "pybind11 example plugin"; // optional module docstring
 
-        m.def("add", &add, "A function which adds two numbers");
+        m.def("add", &add, "A function that adds two numbers");
     }
 
 .. [#f1] In practice, implementation and binding code will generally be located
@@ -136,7 +149,7 @@ On Linux, the above example can be compiled using the following command:
 
 .. code-block:: bash
 
-    $ c++ -O3 -Wall -shared -std=c++11 -fPIC $(python3 -m pybind11 --includes) example.cpp -o example$(python3-config --extension-suffix)
+    $ c++ -O3 -Wall -shared -std=c++11 -fPIC $(python3 -m pybind11 --includes) example.cpp -o example$(python3 -m pybind11 --extension-suffix)
 
 .. note::
 
@@ -166,12 +179,12 @@ load and execute the example:
 .. code-block:: pycon
 
     $ python
-    Python 2.7.10 (default, Aug 22 2015, 20:33:39)
-    [GCC 4.2.1 Compatible Apple LLVM 7.0.0 (clang-700.0.59.1)] on darwin
+    Python 3.9.10 (main, Jan 15 2022, 11:48:04)
+    [Clang 13.0.0 (clang-1300.0.29.3)] on darwin
     Type "help", "copyright", "credits" or "license" for more information.
     >>> import example
     >>> example.add(1, 2)
-    3L
+    3
     >>>
 
 .. _keyword_args:
@@ -282,7 +295,7 @@ converted using the function ``py::cast``.
 
 .. code-block:: cpp
 
-    PYBIND11_MODULE(example, m) {
+    PYBIND11_MODULE(example, m, py::mod_gil_not_used()) {
         m.attr("the_answer") = 42;
         py::object world = py::cast("World");
         m.attr("what") = world;

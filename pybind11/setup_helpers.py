@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 This module provides helpers for C++11+ projects using pybind11.
 
@@ -38,29 +36,47 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 # If you copy this file in, you don't
 # need the .pyi file; it's just an interface file for static type checkers.
+from __future__ import annotations
 
 import contextlib
 import os
 import platform
+import re
+import shlex
 import shutil
 import sys
 import sysconfig
 import tempfile
 import threading
 import warnings
+from collections.abc import Iterable, Iterator
+from functools import lru_cache
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Optional,
+    Union,
+)
 
 try:
     from setuptools import Extension as _Extension
     from setuptools.command.build_ext import build_ext as _build_ext
 except ImportError:
-    from distutils.command.build_ext import build_ext as _build_ext
-    from distutils.extension import Extension as _Extension
+    from distutils.command.build_ext import (  # type: ignore[assignment]
+        build_ext as _build_ext,
+    )
+    from distutils.extension import Extension as _Extension  # type: ignore[assignment]
 
 import distutils.ccompiler
 import distutils.errors
+from importlib.machinery import EXTENSION_SUFFIXES
+
+if TYPE_CHECKING:
+    from typing_extensions import Self
 
 WIN = sys.platform.startswith("win32") and "mingw" not in sysconfig.get_platform()
-PY2 = sys.version_info[0] < 3
 MACOS = sys.platform.startswith("darwin")
 STD_TMPL = "/std:c++{}" if WIN else "-std=c++{}"
 
@@ -70,6 +86,50 @@ STD_TMPL = "/std:c++{}" if WIN else "-std=c++{}"
 # standalone, and pulling pybind11 with the deprecated setup_requires feature.
 # If you copy the file, remember to add it to your MANIFEST.in, and add the current
 # directory into your path if it sits beside your setup.py.
+
+
+def _stable_abi_macro(value: Any, *, abi3t: bool = False) -> tuple[str, str]:
+    """
+    The define for ``py_limited_api``, as ``(name, hex value)``. True selects
+    the minimum pybind11 supports (3.12 for abi3, 3.15 for abi3t), a string
+    such as "3.13" or "cp313" selects that version, and an int or hex string is
+    passed through. A "t" suffix ("3.15t", "cp315t") or ``abi3t=True`` selects
+    abi3t, which is always used on free-threaded Python.
+    """
+    abi3t = abi3t or bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+    text = str(value)
+    if isinstance(value, str) and text.lower().endswith("t"):
+        abi3t = True
+        text = text[:-1]
+    minimum = (3, 15) if abi3t else (3, 12)
+    if value is True:
+        number = (minimum[0] << 24) | (minimum[1] << 16)
+    elif isinstance(value, int):
+        number = value
+    elif text.lower().startswith("0x"):
+        number = int(text, 16)
+    else:
+        match = re.fullmatch(r"(?:cp)?(\d)\.?(\d+)", text)
+        if not match:
+            msg = f"py_limited_api must be True or a Python version such as '3.12', got {value!r}"
+            raise ValueError(msg)
+        major, minor = (int(part) for part in match.groups())
+        number = (major << 24) | (minor << 16)
+    what = "the stable ABI for free-threading (abi3t)" if abi3t else "the stable ABI"
+    requested = (number >> 24, (number >> 16) & 0xFF)
+    if requested < minimum:
+        msg = f"pybind11 supports {what} from Python {minimum[0]}.{minimum[1]} on, got {value!r}"
+        raise ValueError(msg)
+    # Older headers ignore the define (Py_TARGET_ABI3T is new in 3.15) or lack the API, which
+    # would silently produce a version-specific module with a stable-ABI name.
+    building = tuple(sys.version_info[:2])
+    if building < max(minimum, requested):
+        msg = (
+            f"building for {what} of Python {requested[0]}.{requested[1]} needs the headers of "
+            f"that version or newer, but this is Python {building[0]}.{building[1]}"
+        )
+        raise ValueError(msg)
+    return ("Py_TARGET_ABI3T" if abi3t else "Py_LIMITED_API", f"0x{number:08X}")
 
 
 class Pybind11Extension(_Extension):
@@ -95,21 +155,27 @@ class Pybind11Extension(_Extension):
     If you want to add pybind11 headers manually, for example for an exact
     git checkout, then set ``include_pybind11=False``.
 
-    Warning: do not use property-based access to the instance on Python 2 -
-    this is an ugly old-style class due to Distutils.
+    ``py_limited_api=True`` builds against the Python stable ABI (3.12, or
+    pass a version string such as ``"3.13"``): ``Py_LIMITED_API`` is defined
+    and setuptools names the module ``*.abi3.so``, so one wheel serves every
+    CPython from that version on. A ``"t"`` suffix (``"3.15t"``) selects abi3t
+    (``Py_TARGET_ABI3T``, ``*.abi3t.so``), which also loads on free-threaded
+    CPython; it is always used on free-threaded Python. Use the ``build_ext``
+    from this module to get the ``*.abi3t.so`` name on GIL-enabled Python. See
+    the pybind11 documentation for the features that are not available under
+    the stable ABI.
     """
 
     # flags are prepended, so that they can be further overridden, e.g. by
     # ``extra_compile_args=["-g"]``.
 
-    def _add_cflags(self, flags):
+    def _add_cflags(self, flags: list[str]) -> None:
         self.extra_compile_args[:0] = flags
 
-    def _add_ldflags(self, flags):
+    def _add_ldflags(self, flags: list[str]) -> None:
         self.extra_link_args[:0] = flags
 
-    def __init__(self, *args, **kwargs):
-
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._cxx_level = 0
         cxx_std = kwargs.pop("cxx_std", 0)
 
@@ -118,9 +184,33 @@ class Pybind11Extension(_Extension):
 
         include_pybind11 = kwargs.pop("include_pybind11", True)
 
-        # Can't use super here because distutils has old-style classes in
-        # Python 2!
-        _Extension.__init__(self, *args, **kwargs)
+        py_limited_api = kwargs.get("py_limited_api", False)
+        if py_limited_api:
+            # setuptools only uses the flag for the .abi3 file name; the
+            # define selects the limited API in the headers.
+            kwargs["py_limited_api"] = True
+            macros = list(kwargs.get("define_macros", []) or [])
+            abi_macros = [
+                (name, value)
+                for name, value in macros
+                if name in {"Py_LIMITED_API", "Py_TARGET_ABI3T"}
+            ]
+            if abi_macros:
+                # Explicit defines decide the ABI, the file name, and the export symbol.
+                abi3t = any(name == "Py_TARGET_ABI3T" for name, _ in abi_macros)
+                for _, value in abi_macros:
+                    macro = _stable_abi_macro(value, abi3t=abi3t)
+            else:
+                macro = _stable_abi_macro(py_limited_api)
+                macros.append(macro)
+            self._abi3t = macro[0] == "Py_TARGET_ABI3T"
+            kwargs["define_macros"] = macros
+
+        super().__init__(*args, **kwargs)
+
+        # Flags are added in place, so do not modify the caller's lists
+        self.extra_compile_args = list(self.extra_compile_args)
+        self.extra_link_args = list(self.extra_link_args)
 
         # Include the installed package pybind11 headers
         if include_pybind11:
@@ -132,43 +222,42 @@ class Pybind11Extension(_Extension):
 
                 if pyinc not in self.include_dirs:
                     self.include_dirs.append(pyinc)
-            except ImportError:
+            except ModuleNotFoundError:
                 pass
 
-        # Have to use the accessor manually to support Python 2 distutils
-        Pybind11Extension.cxx_std.__set__(self, cxx_std)
+        self.cxx_std = cxx_std
 
         cflags = []
-        ldflags = []
         if WIN:
             cflags += ["/EHsc", "/bigobj"]
         else:
-            cflags += ["-fvisibility=hidden", "-g0"]
-            if MACOS:
-                cflags += ["-stdlib=libc++"]
-                ldflags += ["-stdlib=libc++"]
+            cflags += ["-fvisibility=hidden"]
+            env_cflags = os.environ.get("CFLAGS", "")
+            env_cppflags = os.environ.get("CPPFLAGS", "")
+            c_cpp_flags = shlex.split(env_cflags) + shlex.split(env_cppflags)
+            if not any(opt.startswith("-g") for opt in c_cpp_flags):
+                cflags += ["-g0"]
         self._add_cflags(cflags)
-        self._add_ldflags(ldflags)
 
     @property
-    def cxx_std(self):
+    def cxx_std(self) -> int:
         """
-        The CXX standard level. If set, will add the required flags. If left
-        at 0, it will trigger an automatic search when pybind11's build_ext
-        is used. If None, will have no effect.  Besides just the flags, this
-        may add a register warning/error fix for Python 2 or macos-min 10.9
-        or 10.14.
+        The CXX standard level. If set, will add the required flags. If left at
+        0, it will trigger an automatic search when pybind11's build_ext is
+        used. If None, will have no effect.  Besides just the flags, this may
+        add a macos-min 10.9 or 10.14 flag if MACOSX_DEPLOYMENT_TARGET is
+        unset.
         """
         return self._cxx_level
 
     @cxx_std.setter
-    def cxx_std(self, level):
-
+    def cxx_std(self, level: int) -> None:
         if self._cxx_level:
-            warnings.warn("You cannot safely change the cxx_level after setting it!")
+            warnings.warn(
+                "You cannot safely change the cxx_level after setting it!", stacklevel=2
+            )
 
-        # MSVC 2015 Update 3 and later only have 14 (and later 17) modes, so
-        # force a valid flag here.
+        # MSVC only has 14 and later modes, so force a valid flag here.
         if WIN and level == 11:
             level = 14
 
@@ -189,19 +278,9 @@ class Pybind11Extension(_Extension):
             current_macos = tuple(int(x) for x in platform.mac_ver()[0].split(".")[:2])
             desired_macos = (10, 9) if level < 17 else (10, 14)
             macos_string = ".".join(str(x) for x in min(current_macos, desired_macos))
-            macosx_min = "-mmacosx-version-min=" + macos_string
+            macosx_min = f"-mmacosx-version-min={macos_string}"
             cflags += [macosx_min]
             ldflags += [macosx_min]
-
-        if PY2:
-            if WIN:
-                # Will be ignored on MSVC 2015, where C++17 is not supported so
-                # this flag is not valid.
-                cflags += ["/wd5033"]
-            elif level >= 17:
-                cflags += ["-Wno-register"]
-            elif level >= 14:
-                cflags += ["-Wno-deprecated-register"]
 
         self._add_cflags(cflags)
         self._add_ldflags(ldflags)
@@ -209,11 +288,10 @@ class Pybind11Extension(_Extension):
 
 # Just in case someone clever tries to multithread
 tmp_chdir_lock = threading.Lock()
-cpp_cache_lock = threading.Lock()
 
 
 @contextlib.contextmanager
-def tmp_chdir():
+def tmp_chdir() -> Iterator[str]:
     "Prepare and enter a temporary directory, cleanup when done"
 
     # Threadsafe
@@ -229,7 +307,7 @@ def tmp_chdir():
 
 
 # cf http://bugs.python.org/issue26689
-def has_flag(compiler, flag):
+def has_flag(compiler: Any, flag: str) -> bool:
     """
     Return the flag if a flag name is supported on the
     specified compiler, otherwise None (can be used as a boolean).
@@ -237,23 +315,19 @@ def has_flag(compiler, flag):
     """
 
     with tmp_chdir():
-        fname = "flagcheck.cpp"
-        with open(fname, "w") as f:
-            # Don't trigger -Wunused-parameter.
-            f.write("int main (int, char **) { return 0; }")
+        fname = Path("flagcheck.cpp")
+        # Don't trigger -Wunused-parameter.
+        fname.write_text("int main (int, char **) { return 0; }", encoding="utf-8")
 
         try:
-            compiler.compile([fname], extra_postargs=[flag])
+            compiler.compile([str(fname)], extra_postargs=[flag])
         except distutils.errors.CompileError:
             return False
         return True
 
 
-# Every call will cache the result
-cpp_flag_cache = None
-
-
-def auto_cpp_level(compiler):
+@lru_cache
+def auto_cpp_level(compiler: Any) -> str | int:
     """
     Return the max supported C++ std level (17, 14, or 11). Returns latest on Windows.
     """
@@ -261,19 +335,10 @@ def auto_cpp_level(compiler):
     if WIN:
         return "latest"
 
-    global cpp_flag_cache
-
-    # If this has been previously calculated with the same args, return that
-    with cpp_cache_lock:
-        if cpp_flag_cache:
-            return cpp_flag_cache
-
     levels = [17, 14, 11]
 
     for level in levels:
         if has_flag(compiler, STD_TMPL.format(level)):
-            with cpp_cache_lock:
-                cpp_flag_cache = level
             return level
 
     msg = "Unsupported compiler -- at least C++11 support is needed!"
@@ -287,22 +352,53 @@ class build_ext(_build_ext):  # noqa: N801
     for now, and is completely optional otherwise.
     """
 
-    def build_extensions(self):
+    def build_extensions(self) -> None:
         """
         Build extensions, injecting C++ std for Pybind11Extension if needed.
         """
 
         for ext in self.extensions:
             if hasattr(ext, "_cxx_level") and ext._cxx_level == 0:
-                # Python 2 syntax - old-style distutils class
-                ext.__class__.cxx_std.__set__(ext, auto_cpp_level(self.compiler))
+                ext.cxx_std = auto_cpp_level(self.compiler)
 
-        # Python 2 doesn't allow super here, since distutils uses old-style
-        # classes!
-        _build_ext.build_extensions(self)
+        super().build_extensions()
+
+    def get_export_symbols(self, ext: _Extension) -> list[str]:  # type: ignore[override]
+        """
+        abi3t modules export the PEP 793 ``PyModExport_*`` hook, not ``PyInit_*``.
+        """
+        symbols: list[str] = super().get_export_symbols(ext)  # type: ignore[no-untyped-call]
+        if getattr(ext, "_abi3t", False):
+            name = ext.name.split(".")[-1]
+            symbols = [
+                f"PyModExport_{name}" if s == f"PyInit_{name}" else s for s in symbols
+            ]
+        return symbols
+
+    def get_ext_filename(self, fullname: str) -> str:
+        """
+        setuptools picks the first ``.abi3*`` suffix, which is ``.abi3`` on
+        GIL-enabled Python; abi3t modules need ``.abi3t``.
+        """
+        filename: str = super().get_ext_filename(fullname)  # type: ignore[no-untyped-call]
+        ext = getattr(self, "ext_map", {}).get(fullname)
+        if getattr(ext, "_abi3t", False) and not WIN:
+            for suffix in EXTENSION_SUFFIXES:
+                abi3t_suffix = suffix.replace(".abi3", ".abi3t", 1)
+                if (
+                    suffix.startswith(".abi3")
+                    and not suffix.startswith(".abi3t")
+                    and filename.endswith(suffix)
+                    and abi3t_suffix in EXTENSION_SUFFIXES
+                ):
+                    filename = filename[: -len(suffix)] + abi3t_suffix
+                    break
+        return filename
 
 
-def intree_extensions(paths, package_dir=None):
+def intree_extensions(
+    paths: Iterable[str], package_dir: dict[str, str] | None = None
+) -> list[Pybind11Extension]:
     """
     Generate Pybind11Extensions from source files directly located in a Python
     source tree.
@@ -312,33 +408,37 @@ def intree_extensions(paths, package_dir=None):
     not contain an ``__init__.py`` file.
     """
     exts = []
-    for path in paths:
-        if package_dir is None:
+
+    if package_dir is None:
+        for path in paths:
             parent, _ = os.path.split(path)
             while os.path.exists(os.path.join(parent, "__init__.py")):
                 parent, _ = os.path.split(parent)
             relname, _ = os.path.splitext(os.path.relpath(path, parent))
             qualified_name = relname.replace(os.path.sep, ".")
             exts.append(Pybind11Extension(qualified_name, [path]))
+        return exts
+
+    for path in paths:
+        for prefix, parent in package_dir.items():
+            if path.startswith(parent):
+                relname, _ = os.path.splitext(os.path.relpath(path, parent))
+                qualified_name = relname.replace(os.path.sep, ".")
+                if prefix:
+                    qualified_name = prefix + "." + qualified_name
+                exts.append(Pybind11Extension(qualified_name, [path]))
+                break
         else:
-            found = False
-            for prefix, parent in package_dir.items():
-                if path.startswith(parent):
-                    found = True
-                    relname, _ = os.path.splitext(os.path.relpath(path, parent))
-                    qualified_name = relname.replace(os.path.sep, ".")
-                    if prefix:
-                        qualified_name = prefix + "." + qualified_name
-                    exts.append(Pybind11Extension(qualified_name, [path]))
-            if not found:
-                raise ValueError(
-                    "path {} is not a child of any of the directories listed "
-                    "in 'package_dir' ({})".format(path, package_dir)
-                )
+            msg = (
+                f"path {path} is not a child of any of the directories listed "
+                f"in 'package_dir' ({package_dir})"
+            )
+            raise ValueError(msg)
+
     return exts
 
 
-def naive_recompile(obj, src):
+def naive_recompile(obj: str, src: str) -> bool:
     """
     This will recompile only if the source file changes. It does not check
     header files, so a more advanced function or Ccache is better if you have
@@ -347,7 +447,7 @@ def naive_recompile(obj, src):
     return os.stat(obj).st_mtime < os.stat(src).st_mtime
 
 
-def no_recompile(obg, src):
+def no_recompile(obj: str, src: str) -> bool:  # noqa: ARG001
     """
     This is the safest but slowest choice (and is the default) - will always
     recompile sources.
@@ -355,15 +455,31 @@ def no_recompile(obg, src):
     return True
 
 
+CCompilerMethod = Callable[
+    [
+        distutils.ccompiler.CCompiler,
+        list[str],
+        Optional[str],
+        Optional[list[Union[tuple[str], tuple[str, Optional[str]]]]],
+        Optional[list[str]],
+        bool,
+        Optional[list[str]],
+        Optional[list[str]],
+        Optional[list[str]],
+    ],
+    list[str],
+]
+
+
 # Optional parallel compile utility
 # inspired by: http://stackoverflow.com/questions/11013851/speeding-up-build-process-with-distutils
 # and: https://github.com/tbenthompson/cppimport/blob/stable/cppimport/build_module.py
 # and NumPy's parallel distutils module:
 #              https://github.com/numpy/numpy/blob/master/numpy/distutils/ccompiler.py
-class ParallelCompile(object):
+class ParallelCompile:
     """
     Make a parallel compile function. Inspired by
-    numpy.distutils.ccompiler.CCompiler_compile and cppimport.
+    numpy.distutils.ccompiler.CCompiler.compile and cppimport.
 
     This takes several arguments that allow you to customize the compile
     function created:
@@ -396,37 +512,42 @@ class ParallelCompile(object):
     called.
     """
 
-    __slots__ = ("envvar", "default", "max", "_old", "needs_recompile")
+    __slots__ = ("_old", "default", "envvar", "max", "needs_recompile")
 
-    def __init__(self, envvar=None, default=0, max=0, needs_recompile=no_recompile):
+    def __init__(
+        self,
+        envvar: str | None = None,
+        default: int = 0,
+        max: int = 0,  # pylint: disable=redefined-builtin
+        needs_recompile: Callable[[str, str], bool] = no_recompile,
+    ) -> None:
         self.envvar = envvar
         self.default = default
         self.max = max
         self.needs_recompile = needs_recompile
-        self._old = []
+        self._old: list[CCompilerMethod] = []
 
-    def function(self):
+    def function(self) -> CCompilerMethod:
         """
         Builds a function object usable as distutils.ccompiler.CCompiler.compile.
         """
 
         def compile_function(
-            compiler,
-            sources,
-            output_dir=None,
-            macros=None,
-            include_dirs=None,
-            debug=0,
-            extra_preargs=None,
-            extra_postargs=None,
-            depends=None,
-        ):
-
+            compiler: distutils.ccompiler.CCompiler,
+            sources: list[str],
+            output_dir: str | None = None,
+            macros: list[tuple[str] | tuple[str, str | None]] | None = None,
+            include_dirs: list[str] | None = None,
+            debug: bool = False,
+            extra_preargs: list[str] | None = None,
+            extra_postargs: list[str] | None = None,
+            depends: list[str] | None = None,
+        ) -> Any:
             # These lines are directly from distutils.ccompiler.CCompiler
-            macros, objects, extra_postargs, pp_opts, build = compiler._setup_compile(
+            macros, objects, extra_postargs, pp_opts, build = compiler._setup_compile(  # type: ignore[attr-defined]
                 output_dir, macros, include_dirs, sources, depends, extra_postargs
             )
-            cc_args = compiler._get_cc_args(pp_opts, debug, extra_preargs)
+            cc_args = compiler._get_cc_args(pp_opts, debug, extra_preargs)  # type: ignore[attr-defined]
 
             # The number of threads; start with default.
             threads = self.default
@@ -435,14 +556,14 @@ class ParallelCompile(object):
             if self.envvar is not None:
                 threads = int(os.environ.get(self.envvar, self.default))
 
-            def _single_compile(obj):
+            def _single_compile(obj: Any) -> None:
                 try:
                     src, ext = build[obj]
                 except KeyError:
                     return
 
                 if not os.path.exists(obj) or self.needs_recompile(obj, src):
-                    compiler._compile(obj, src, ext, cc_args, extra_postargs, pp_opts)
+                    compiler._compile(obj, src, ext, cc_args, extra_postargs, pp_opts)  # type: ignore[attr-defined]
 
             try:
                 # Importing .synchronize checks for platforms that have some multiprocessing
@@ -460,8 +581,9 @@ class ParallelCompile(object):
                     threads = 1
 
             if threads > 1:
-                for _ in ThreadPool(threads).imap_unordered(_single_compile, objects):
-                    pass
+                with ThreadPool(threads) as pool:
+                    for _ in pool.imap_unordered(_single_compile, objects):
+                        pass
             else:
                 for ob in objects:
                     _single_compile(ob)
@@ -470,13 +592,16 @@ class ParallelCompile(object):
 
         return compile_function
 
-    def install(self):
-        distutils.ccompiler.CCompiler.compile = self.function()
+    def install(self) -> Self:
+        """
+        Installs the compile function into distutils.ccompiler.CCompiler.compile.
+        """
+        distutils.ccompiler.CCompiler.compile = self.function()  # type: ignore[assignment]
         return self
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         self._old.append(distutils.ccompiler.CCompiler.compile)
         return self.install()
 
-    def __exit__(self, *args):
-        distutils.ccompiler.CCompiler.compile = self._old.pop()
+    def __exit__(self, *args: object) -> None:
+        distutils.ccompiler.CCompiler.compile = self._old.pop()  # type: ignore[assignment]

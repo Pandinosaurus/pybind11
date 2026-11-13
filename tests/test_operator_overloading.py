@@ -1,10 +1,13 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import pytest
 
+import env
 from pybind11_tests import ConstructorStats
 from pybind11_tests import operators as m
 
 
+@pytest.mark.xfail("env.GRAALPY", reason="TODO should get fixed on GraalPy side")
 def test_operator_overloading():
     v1 = m.Vector2(1, 2)
     v2 = m.Vector(3, -1)
@@ -47,6 +50,9 @@ def test_operator_overloading():
     assert str(v1) == "[1.500000, -0.125000]"
     v2 /= v1
     assert str(v2) == "[2.000000, 8.000000]"
+
+    if env.GRAALPY:
+        pytest.skip("ConstructorStats is incompatible with GraalPy.")
 
     cstats = ConstructorStats.get(m.Vector2)
     assert cstats.alive() == 3
@@ -131,12 +137,12 @@ def test_nested():
 
 
 def test_overriding_eq_reset_hash():
-
     assert m.Comparable(15) is not m.Comparable(15)
     assert m.Comparable(15) == m.Comparable(15)
 
-    with pytest.raises(TypeError):
-        hash(m.Comparable(15))  # TypeError: unhashable type: 'm.Comparable'
+    with pytest.raises(TypeError) as excinfo:
+        hash(m.Comparable(15))
+    assert str(excinfo.value).startswith("unhashable type:")
 
     for hashable in (m.Hashable, m.Hashable2):
         assert hashable(15) is not hashable(15)
@@ -144,3 +150,9 @@ def test_overriding_eq_reset_hash():
 
         assert hash(hashable(15)) == 15
         assert hash(hashable(15)) == hash(hashable(15))
+
+
+def test_return_set_of_unhashable():
+    with pytest.raises(TypeError) as excinfo:
+        m.get_unhashable_HashMe_set()
+    assert "unhashable type" in str(excinfo.value.__cause__)
